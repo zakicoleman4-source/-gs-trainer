@@ -1,0 +1,76 @@
+# gs_pipeline trainer defaults.
+#
+# All values are tunable; the UI only exposes `quality.preset` ("Auto" vs
+# "Maximum"). Everything else stays here so end users never have to think
+# about it. The trainer reads this file at startup; per-job overrides come
+# from work/<job_id>/config_override.yaml when the watcher needs to retry
+# under OOM pressure (smaller cap_max, smaller image_max_side).
+
+quality:
+  preset: Auto                  # "Auto" | "Maximum" — overridden by UI
+
+iterations:
+  Auto: 30000
+  Maximum: 50000
+
+# Splat-budget heuristic (mirrors trainer/budget.py constants).
+budget:
+  vram_safety: 0.92
+  fixed_overhead_bytes: 3_000_000_000
+  per_splat_bytes: 1280
+  target_floor: 500_000
+  target_cap_ratio: 0.85
+  quality_target_mult:
+    Auto: 1.0
+    Maximum: 1.25
+  max_image_side: 2000           # raise to e.g. 2600 on 48 GB cards via override
+
+# Anti-Milky-Way defaults. These are the *quality* knobs.
+mcmc:
+  noise_lr: 5.0e5                # gsplat MCMCStrategy default; per-mean noise scale
+  refine_start_iter: 500
+  refine_stop_iter_ratio: 0.85   # int(0.85 * iterations)
+  refine_every: 100              # densify/relocate cadence
+  prune_opa: 0.005               # aggressive transparent-splat pruning
+
+sh:
+  degree: 3
+  warmup_interval: 1500          # degree += 1 every N iters until cap
+
+regularization:
+  opacity_reg: 0.01              # kills semi-transparent floaters
+  scale_reg: 0.01                # kills oversized planar splats
+
+init:
+  init_opacity: 0.1
+  init_scale_knn_k: 3            # init scale = mean(knn distance, k=3) * 0.5
+
+planes:
+  near_plane_extent_ratio: 0.01  # near = scene_extent * this
+  far_plane_extent_ratio: 100.0  # far  = scene_extent * this
+
+background:
+  random_per_step: true          # anti-floater trick when no masks present
+  default_color: [0.0, 0.0, 0.0]
+
+eval:
+  holdout_stride: 8              # every Nth camera held out for PSNR/SSIM
+  eval_every: 1000
+  preview_every: 1000
+
+checkpoint:
+  every: 5000                    # write ckpt + intermediate .ply every N iters
+
+divergence_abort:
+  enabled: true
+  min_psnr_at_step: 12.0
+  check_at_step: 10000
+
+watchdog:
+  per_window_seconds: 1800       # 30-min watchdog; SIGTERM if no progress
+  poll_interval_seconds: 30
+
+oom:
+  shrinkers:
+    - halve_cap_max
+    - halve_image_resolution
