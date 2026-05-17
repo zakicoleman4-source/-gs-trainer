@@ -1,0 +1,8 @@
+# Trainer-side GPU stack. Installed inside the Docker image.
+# torch is installed separately in the Dockerfile with the cu124 index URL.
+# gsplat is built from a pinned commit with MAX_JOBS=2 (no isolation).
+-r requirements-cpu.txt
+open3d>=0.18
+tyro>=0.8
+matplotlib>=3.8
+scikit-image>=0.22
