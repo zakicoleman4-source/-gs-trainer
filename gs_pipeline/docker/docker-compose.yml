@@ -1,0 +1,36 @@
+services:
+  gs_pipeline:
+    build:
+      # Build context is the gs_pipeline package root so the Dockerfile
+      # can COPY both requirements*.txt and gs_pipeline/ as siblings.
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: gs_pipeline:latest
+    container_name: gs_pipeline
+    restart: unless-stopped
+    ports:
+      - "8501:8501"   # Streamlit UI
+    # Mounts: inbox = where the .zip lands, outbox = final splat .ply,
+    # logs/work = job artefacts the UI polls.
+    volumes:
+      - ./inbox:/data/inbox
+      - ./outbox:/data/outbox
+      - ./logs:/data/logs
+      - ./work:/data/work
+      - ./config:/data/config
+    environment:
+      MAX_UPLOAD_GB: "8"
+      QUALITY_PRESET_DEFAULT: "Auto"
+      MAX_IMAGE_SIDE: "2000"
+    # NVIDIA GPU passthrough. Requires `nvidia-container-toolkit` on the host
+    # and Docker 20.10+; the older `runtime: nvidia` form also works.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    # Single-job concurrency: even if you scale to >1 container the worker
+    # inside each one will only train one bundle at a time.
+    shm_size: "2gb"
