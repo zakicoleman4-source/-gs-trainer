@@ -1,0 +1,28 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+env/
+.env
+.DS_Store
+Thumbs.db
+
+# Runtime job dirs (created by the watcher; not source)
+inbox/
+outbox/
+logs/
+work/
+config/local_overrides.yaml
+
+# Build artifacts
+*.egg-info/
+build/
+dist/
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo

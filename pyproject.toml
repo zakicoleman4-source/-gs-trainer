@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gs_pipeline"
+version = "0.1.0"
+description = "Metashape -> Gaussian Splat training pipeline (Docker + Streamlit UI)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "plyfile>=1.0",
+    "pyyaml>=6.0",
+    "pillow>=10.0",
+    "watchdog>=4.0",
+    "streamlit>=1.36",
+]
+
+[project.optional-dependencies]
+gpu = [
+    "open3d>=0.18",
+    "tyro>=0.8",
+    "matplotlib>=3.8",
+    "scikit-image>=0.22",
+]
+test = [
+    "pytest>=8.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["gs_pipeline*"]
+
+[tool.pytest.ini_options]
+testpaths = ["gs_pipeline/tests"]
+addopts = "-ra --strict-markers -q"
+markers = [
+    "gpu: requires a CUDA-capable GPU and torch+gsplat installed (skipped on CPU CI)",
+    "slow: long-running test (>10s); skipped by default unless -m slow",
+]
