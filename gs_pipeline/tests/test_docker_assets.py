@@ -74,6 +74,30 @@ def test_dockerfile_entrypoint_is_script():
     assert 'ENTRYPOINT ["/entrypoint.sh"]' in text
 
 
+def test_dockerfile_copy_sources_resolve_against_build_context():
+    """Each COPY src must exist relative to the compose build context.
+
+    docker-compose.yml sets `context: ..` from gs_pipeline/docker/, so the
+    context root is the gs_pipeline/ package directory. A bad COPY path
+    (e.g. `COPY gs_pipeline/` when no nested gs_pipeline/gs_pipeline/
+    exists) only surfaces at image-build time; this test fails the unit
+    suite instead.
+    """
+    text = _read_dockerfile()
+    context_root = DOCKER_DIR.parent
+    for raw in re.findall(r"^\s*COPY\s+(.+)$", text, flags=re.MULTILINE):
+        tokens = raw.split()
+        if not tokens or tokens[0].startswith("--"):
+            continue  # skip COPY --from=... and other flagged forms
+        srcs = tokens[:-1]
+        for src in srcs:
+            resolved = (context_root / src).resolve()
+            assert resolved.exists(), (
+                f"COPY source {src!r} does not exist under build context "
+                f"{context_root} (resolved to {resolved})"
+            )
+
+
 # ---------------------------------------------------------------------------
 # docker-compose.yml
 # ---------------------------------------------------------------------------

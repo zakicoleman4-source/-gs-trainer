@@ -50,8 +50,10 @@ RUN pip install -r requirements-gpu.txt
 # on smaller build hosts.
 RUN pip install --no-build-isolation gsplat==1.4.0
 
-# Application code.
-COPY gs_pipeline/ /app/gs_pipeline/
+# Application code. Build context is the gs_pipeline package directory
+# (see docker-compose.yml: context = ..), so `.` here is the package root
+# and we copy its contents into /app/gs_pipeline/.
+COPY . /app/gs_pipeline/
 COPY docker/supervisord.conf /etc/supervisor/conf.d/gs_pipeline.conf
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
