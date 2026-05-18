@@ -56,6 +56,14 @@ from gs_pipeline.trainer.oom_guard import (
     set_memory_fraction,
 )
 from gs_pipeline.trainer.parse_metashape import ParsedScene
+from gs_pipeline.trainer.render_eval import (
+    RenderInputs,
+    _gather_sh,
+    _load_camera,
+    evaluate_holdout,
+    psnr,
+    save_preview_png,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -166,20 +174,6 @@ def knn_mean_distance(xyz: np.ndarray, k: int = 3) -> np.ndarray:
         nearest = np.partition(d2, k_eff - 1, axis=1)[:, :k_eff]
         out[i:i + block] = np.sqrt(np.mean(nearest, axis=1)).astype(np.float32)
     return out
-
-
-# ---------------------------------------------------------------------------
-# Photometric metrics (CPU-friendly, used in unit tests)
-# ---------------------------------------------------------------------------
-
-def psnr(pred: np.ndarray, gt: np.ndarray, *, max_val: float = 1.0) -> float:
-    """Per-image PSNR. Inputs in [0, max_val]."""
-    pred = np.asarray(pred, dtype=np.float64)
-    gt = np.asarray(gt, dtype=np.float64)
-    mse = float(np.mean((pred - gt) ** 2))
-    if mse <= 0.0:
-        return float("inf")
-    return float(20.0 * math.log10(max_val) - 10.0 * math.log10(mse))
 
 
 # ---------------------------------------------------------------------------
@@ -363,13 +357,14 @@ def train(
 
             # Eval / preview.
             if step % config.eval_every == 0:
-                holdout_psnr, holdout_ssim = _eval_holdout(
-                    scene=scene, holdout_idx=holdout_idx,
+                render_inputs = RenderInputs(
                     means=means, scales=scales, quats=quats, opacities=opacities,
-                    sh_dc=sh_dc, sh_rest=sh_rest, sh_degree=active_sh_degree,
-                    full_sh_degree=config.sh_degree,
-                    near=near, far=far, downscale=budget.downscale_factor,
-                    device=device,
+                    sh_dc=sh_dc, sh_rest=sh_rest,
+                    sh_degree=active_sh_degree, full_sh_degree=config.sh_degree,
+                )
+                holdout_psnr, holdout_ssim = evaluate_holdout(
+                    render_inputs, scene=scene, holdout_idx=holdout_idx,
+                    near_plane=near, far_plane=far, downscale=budget.downscale_factor,
                 )
                 with metrics_path.open("a", encoding="utf-8") as f:
                     f.write(f"{step},{float(loss.item()):.6f},{holdout_psnr:.4f},{holdout_ssim:.4f}\n")
@@ -391,13 +386,15 @@ def train(
                     )
 
             if step % config.preview_every == 0:
-                _save_preview(
-                    scene=scene, holdout_idx=holdout_idx,
+                preview_inputs = RenderInputs(
                     means=means, scales=scales, quats=quats, opacities=opacities,
-                    sh_dc=sh_dc, sh_rest=sh_rest, sh_degree=active_sh_degree,
-                    full_sh_degree=config.sh_degree,
-                    near=near, far=far, downscale=budget.downscale_factor,
-                    out_path=work_dir / "preview.png", device=device,
+                    sh_dc=sh_dc, sh_rest=sh_rest,
+                    sh_degree=active_sh_degree, full_sh_degree=config.sh_degree,
+                )
+                save_preview_png(
+                    preview_inputs, scene=scene, holdout_idx=holdout_idx,
+                    near_plane=near, far_plane=far, downscale=budget.downscale_factor,
+                    out_path=work_dir / "preview.png",
                 )
 
             if step % config.checkpoint_every == 0:
@@ -480,19 +477,6 @@ def _rgb_to_sh_dc(rgb):  # tensor in [0,1]
     return (rgb - 0.5) / C0
 
 
-def _gather_sh(sh_dc, sh_rest, active_deg: int, full_deg: int):
-    """Stack DC + active rest, pad with zeros so gsplat sees full_deg coeffs."""
-    import torch
-    n = sh_dc.shape[0]
-    active_dim = (active_deg + 1) ** 2 - 1
-    full_dim = (full_deg + 1) ** 2 - 1
-    rest = sh_rest.clone()
-    if active_dim < full_dim:
-        rest = rest.clone()
-        rest[:, active_dim:] = 0.0
-    return torch.cat([sh_dc[:, None, :], rest], dim=1)
-
-
 def _strategy_params(means, scales, quats, opacities, sh_dc, sh_rest):
     return {
         "means": means, "scales": scales, "quats": quats,
@@ -500,87 +484,24 @@ def _strategy_params(means, scales, quats, opacities, sh_dc, sh_rest):
     }
 
 
-def _load_camera(scene: ParsedScene, i: int):
-    import torch
-    K = torch.from_numpy(scene.K_per_camera[i]).float()
-    w2c = torch.from_numpy(scene.w2c_per_camera[i]).float()
-    return K, w2c, scene.image_paths[i]
-
-
 def _load_image_tensor(image_path: Path, downscale: float, device):
+    """Load a training image as a torch tensor on ``device`` in ``[0, 1]``."""
     import torch
-    from PIL import Image
-    img = Image.open(image_path).convert("RGB")
-    if downscale < 1.0:
-        w, h = img.size
-        img = img.resize((int(round(w * downscale)), int(round(h * downscale))), Image.BILINEAR)
-    arr = np.asarray(img, dtype=np.float32) / 255.0
-    return torch.from_numpy(arr).to(device)
+    from gs_pipeline.trainer.render_eval import _load_image_np
+    return torch.from_numpy(_load_image_np(image_path, downscale)).to(device)
 
 
 def _ssim_loss(pred, target):
-    """1 - SSIM. Lazy-imports skimage; if unavailable, returns L2."""
+    """Differentiable-ish SSIM loss term: ``1 - SSIM`` (skimage path) or L2 fallback."""
     try:
-        from skimage.metrics import structural_similarity as ssim
+        from skimage.metrics import structural_similarity as sk_ssim
     except Exception:
         return ((pred - target) ** 2).mean()
     import torch
     p = pred.detach().cpu().numpy()
     t = target.detach().cpu().numpy()
-    s = ssim(t, p, channel_axis=-1, data_range=1.0)
-    return (1.0 - float(s)) * torch.ones((), device=pred.device, requires_grad=True)
-
-
-def _eval_holdout(*, scene, holdout_idx, means, scales, quats, opacities,
-                  sh_dc, sh_rest, sh_degree, full_sh_degree, near, far,
-                  downscale, device) -> tuple[float, float]:
-    import torch
-    from gsplat import rasterization
-    psnrs: list[float] = []
-    ssims: list[float] = []
-    with torch.no_grad():
-        for i in holdout_idx:
-            K, w2c, image_path = _load_camera(scene, i)
-            target = _load_image_tensor(image_path, downscale, device)
-            sh_active = _gather_sh(sh_dc, sh_rest, sh_degree, full_sh_degree)
-            colors, _, _ = rasterization(
-                means=means, quats=torch.nn.functional.normalize(quats, dim=-1),
-                scales=torch.exp(scales), opacities=torch.sigmoid(opacities),
-                colors=sh_active, viewmats=w2c[None].to(device), Ks=K[None].to(device),
-                width=target.shape[1], height=target.shape[0],
-                near_plane=near, far_plane=far, sh_degree=sh_degree,
-            )
-            pred = colors[0].clamp(0, 1)
-            psnrs.append(psnr(pred.cpu().numpy(), target.cpu().numpy()))
-            try:
-                from skimage.metrics import structural_similarity as ssim
-                ssims.append(float(ssim(target.cpu().numpy(), pred.cpu().numpy(),
-                                        channel_axis=-1, data_range=1.0)))
-            except Exception:
-                ssims.append(0.0)
-    return float(np.mean(psnrs)), float(np.mean(ssims))
-
-
-def _save_preview(*, scene, holdout_idx, means, scales, quats, opacities,
-                  sh_dc, sh_rest, sh_degree, full_sh_degree, near, far,
-                  downscale, out_path, device) -> None:
-    import torch
-    from gsplat import rasterization
-    from PIL import Image
-    i = holdout_idx[0]
-    K, w2c, image_path = _load_camera(scene, i)
-    target = _load_image_tensor(image_path, downscale, device)
-    with torch.no_grad():
-        sh_active = _gather_sh(sh_dc, sh_rest, sh_degree, full_sh_degree)
-        colors, _, _ = rasterization(
-            means=means, quats=torch.nn.functional.normalize(quats, dim=-1),
-            scales=torch.exp(scales), opacities=torch.sigmoid(opacities),
-            colors=sh_active, viewmats=w2c[None].to(device), Ks=K[None].to(device),
-            width=target.shape[1], height=target.shape[0],
-            near_plane=near, far_plane=far, sh_degree=sh_degree,
-        )
-    arr = (colors[0].clamp(0, 1).cpu().numpy() * 255).astype("uint8")
-    Image.fromarray(arr).save(out_path)
+    s = float(sk_ssim(t, p, channel_axis=-1, data_range=1.0))
+    return (1.0 - s) * torch.ones((), device=pred.device, requires_grad=True)
 
 
 def _tick(job_state: JobState, path: Path, *, step: int, splats: int, loss: float) -> None:
