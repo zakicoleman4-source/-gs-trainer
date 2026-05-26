@@ -106,6 +106,7 @@ def test_render_view_requires_torch_and_gsplat():
 
 def test_load_camera_scales_K_by_downscale():
     """_load_camera must scale the K matrix when downscale < 1.0."""
+    pytest.importorskip("torch")
     K_native = np.array(
         [[1000.0, 0.0, 500.0],
          [0.0, 1000.0, 400.0],
