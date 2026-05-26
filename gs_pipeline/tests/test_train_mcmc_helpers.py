@@ -186,3 +186,59 @@ def test_auto_adjust_config_large_scene():
     large = auto_adjust_config_for_scene(base, n_cameras=1500)
     assert large.holdout_stride == 16
     assert large.eval_every == 2000
+
+
+# ---------------------------------------------------------------------------
+# Taming 3DGS config
+# ---------------------------------------------------------------------------
+
+def test_taming_opacity_enabled_by_default():
+    """Taming is on by default — abs().clamp() activates at 50% of training."""
+    cfg = TrainerConfig()
+    assert cfg.taming_opacity_enabled is True
+    assert cfg.taming_start_frac == 0.5
+
+
+def test_taming_loads_from_yaml():
+    cfg_path = Path(__file__).resolve().parent.parent / "trainer" / "config.yaml"
+    cfg = load_trainer_config(cfg_path)
+    assert cfg.taming_opacity_enabled is True
+    assert cfg.taming_start_frac == pytest.approx(0.5)
+
+
+def test_taming_can_be_disabled_via_yaml(tmp_path: Path):
+    src = (Path(__file__).resolve().parent.parent / "trainer" / "config.yaml").read_text()
+    mutated = tmp_path / "cfg.yaml"
+    mutated.write_text(src + "\ntaming:\n  enabled: false\n", encoding="utf-8")
+    cfg = load_trainer_config(mutated)
+    assert cfg.taming_opacity_enabled is False
+
+
+# ---------------------------------------------------------------------------
+# Fisher pruning config
+# ---------------------------------------------------------------------------
+
+def test_fisher_prune_disabled_by_default():
+    cfg = TrainerConfig()
+    assert cfg.fisher_prune_enabled is False
+
+
+def test_fisher_prune_loads_from_yaml():
+    cfg_path = Path(__file__).resolve().parent.parent / "trainer" / "config.yaml"
+    cfg = load_trainer_config(cfg_path)
+    assert cfg.fisher_prune_enabled is False
+    assert cfg.fisher_prune_ratio == pytest.approx(0.5)
+    assert cfg.fisher_prune_n_views == 20
+
+
+def test_fisher_prune_can_be_enabled_via_yaml(tmp_path: Path):
+    src = (Path(__file__).resolve().parent.parent / "trainer" / "config.yaml").read_text()
+    mutated = tmp_path / "cfg.yaml"
+    mutated.write_text(
+        src + "\nfisher_prune:\n  enabled: true\n  keep_ratio: 0.6\n  n_views: 10\n",
+        encoding="utf-8",
+    )
+    cfg = load_trainer_config(mutated)
+    assert cfg.fisher_prune_enabled is True
+    assert cfg.fisher_prune_ratio == pytest.approx(0.6)
+    assert cfg.fisher_prune_n_views == 10
