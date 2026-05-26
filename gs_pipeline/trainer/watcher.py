@@ -250,6 +250,11 @@ def _original_name(claim_path: Path) -> str:
 
 def watcher_main(argv: Optional[list] = None) -> int:
     """``python -m gs_pipeline.trainer.watcher`` entry point — starts ``run_forever``."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
     import argparse
     parser = argparse.ArgumentParser(description="Run the gs_pipeline inbox watcher.")
     parser.add_argument("--inbox", required=True, type=Path)
@@ -260,6 +265,10 @@ def watcher_main(argv: Optional[list] = None) -> int:
     parser.add_argument("--quality-preset", default="Auto", choices=["Auto", "Maximum"])
     parser.add_argument("--poll-interval", type=float, default=DEFAULT_POLL_INTERVAL)
     args = parser.parse_args(argv)
+    _log.info(
+        "watcher starting: inbox=%s work=%s outbox=%s logs=%s config=%s preset=%s",
+        args.inbox, args.work, args.outbox, args.logs, args.config_yaml, args.quality_preset,
+    )
     paths = WatcherPaths(
         inbox=args.inbox, work=args.work, outbox=args.outbox,
         logs=args.logs, config_yaml=args.config_yaml,
