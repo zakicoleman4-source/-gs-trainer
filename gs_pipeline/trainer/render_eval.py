@@ -14,7 +14,7 @@ import logging
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Optional, Sequence
 
 import numpy as np
 
@@ -121,16 +121,18 @@ def evaluate_holdout(
     holdout_idx: Sequence[int],
     near_plane: float,
     far_plane: float,
-    downscale: float,
+    downscale: float = 1.0,
+    downscale_per_camera: Optional[list[float]] = None,
 ) -> tuple[float, float]:
     """Mean PSNR / SSIM over the holdout cameras. Returns (psnr, ssim)."""
     import torch
     psnrs: list[float] = []
     ssims: list[float] = []
     with torch.no_grad():
-        for i in holdout_idx:
-            K, w2c, image_path = _load_camera(scene, i)
-            target_np = _load_image_np(image_path, downscale)
+        for list_pos, cam_i in enumerate(holdout_idx):
+            ds = downscale_per_camera[cam_i] if downscale_per_camera is not None else downscale
+            K, w2c, image_path = _load_camera(scene, cam_i, downscale=ds)
+            target_np = _load_image_np(image_path, ds)
             target = torch.from_numpy(target_np).to(inputs.means.device)
             pred, _ = render_view(
                 inputs, K=K.to(inputs.means.device), w2c=w2c.to(inputs.means.device),
@@ -150,7 +152,8 @@ def save_preview_png(
     holdout_idx: Sequence[int],
     near_plane: float,
     far_plane: float,
-    downscale: float,
+    downscale: float = 1.0,
+    downscale_per_camera: Optional[list[float]] = None,
     out_path: Path,
 ) -> None:
     """Render one holdout view and save as PNG for the UI live-preview tile."""
@@ -159,8 +162,9 @@ def save_preview_png(
     if not holdout_idx:
         raise ValueError("save_preview_png needs at least one holdout camera")
     i = int(holdout_idx[0])
-    K, w2c, image_path = _load_camera(scene, i)
-    target_np = _load_image_np(image_path, downscale)
+    ds = downscale_per_camera[i] if downscale_per_camera is not None else downscale
+    K, w2c, image_path = _load_camera(scene, i, downscale=ds)
+    target_np = _load_image_np(image_path, ds)
     with torch.no_grad():
         pred, _ = render_view(
             inputs, K=K.to(inputs.means.device), w2c=w2c.to(inputs.means.device),
@@ -170,6 +174,81 @@ def save_preview_png(
     arr = (pred.detach().cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     Image.fromarray(arr).save(out_path)
+
+
+def save_preview_strip(
+    inputs: RenderInputs,
+    *,
+    scene,
+    holdout_idx: Sequence[int],
+    near_plane: float,
+    far_plane: float,
+    downscale: float = 1.0,
+    downscale_per_camera: Optional[list[float]] = None,
+    out_path: Path,
+    target_height_px: int = 400,
+) -> None:
+    """Render up to 3 holdout cameras and save side-by-side as a strip PNG.
+
+    Picks cameras from start, middle, end of holdout_idx for scene coverage.
+    Scales each panel to target_height_px tall (maintaining aspect ratio).
+    """
+    import torch
+    from PIL import Image
+
+    if not holdout_idx:
+        raise ValueError("save_preview_strip needs at least one holdout camera")
+
+    # Pick up to 3 indices: first, middle, last (deduplicated)
+    idx_list = list(holdout_idx)
+    n = len(idx_list)
+    candidates = [idx_list[0], idx_list[n // 2], idx_list[-1]]
+    # Deduplicate while preserving order
+    seen: set[int] = set()
+    selected: list[int] = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            selected.append(c)
+
+    SEPARATOR_WIDTH = 4
+    panels: list[np.ndarray] = []
+
+    with torch.no_grad():
+        for cam_i in selected:
+            ds = downscale_per_camera[cam_i] if downscale_per_camera is not None else downscale
+            K, w2c, image_path = _load_camera(scene, cam_i, downscale=ds)
+            target_np = _load_image_np(image_path, ds)
+            pred, _ = render_view(
+                inputs,
+                K=K.to(inputs.means.device),
+                w2c=w2c.to(inputs.means.device),
+                width=target_np.shape[1],
+                height=target_np.shape[0],
+                near_plane=near_plane,
+                far_plane=far_plane,
+            )
+            arr = (pred.detach().cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+            # Resize to target_height_px maintaining aspect ratio
+            h, w = arr.shape[:2]
+            new_w = max(1, int(round(w * target_height_px / h)))
+            resized = np.asarray(
+                Image.fromarray(arr).resize((new_w, target_height_px), Image.LANCZOS),
+                dtype=np.uint8,
+            )
+            panels.append(resized)
+
+    # Build strip: panels separated by white vertical bars
+    strip_parts: list[np.ndarray] = []
+    separator = np.full((target_height_px, SEPARATOR_WIDTH, 3), 255, dtype=np.uint8)
+    for idx, panel in enumerate(panels):
+        if idx > 0:
+            strip_parts.append(separator)
+        strip_parts.append(panel)
+
+    strip = np.concatenate(strip_parts, axis=1)
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(strip).save(out_path)
 
 
 # ---------------------------------------------------------------------------
@@ -187,9 +266,14 @@ def _gather_sh(sh_dc, sh_rest, active_deg: int, full_deg: int):
     return torch.cat([sh_dc[:, None, :], rest], dim=1)
 
 
-def _load_camera(scene, i: int):
+def _load_camera(scene, i: int, downscale: float = 1.0):
     import torch
     K = torch.from_numpy(scene.K_per_camera[i]).float()
+    if downscale != 1.0:
+        K = K.clone()
+        K[0] *= downscale  # scale row 0: fx, skew, cx — all scale together
+        K[1] *= downscale  # scale row 1: 0, fy, cy — all scale together
+        # K[2] = [0, 0, 1] — unchanged
     w2c = torch.from_numpy(scene.w2c_per_camera[i]).float()
     return K, w2c, scene.image_paths[i]
 
@@ -201,6 +285,6 @@ def _load_image_np(image_path: Path, downscale: float) -> np.ndarray:
         w, h = img.size
         img = img.resize(
             (max(1, int(round(w * downscale))), max(1, int(round(h * downscale)))),
-            Image.BILINEAR,
+            Image.LANCZOS,
         )
     return (np.asarray(img, dtype=np.float32) / 255.0)

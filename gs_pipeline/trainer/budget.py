@@ -50,13 +50,23 @@ DEFAULT_PER_SPLAT_BYTES = 1280
 # Floor on target splat count: never train an under-populated scene.
 DEFAULT_TARGET_FLOOR = 500_000
 # Fraction of hard_cap reserved as relocate headroom.
-DEFAULT_TARGET_CAP_RATIO = 0.85
+DEFAULT_TARGET_CAP_RATIO = 0.87
 # Image side cap (longest dim, pixels). Above this, we downscale per-job.
 DEFAULT_MAX_IMAGE_SIDE = 2000
 
+# VRAM thresholds (bytes) → recommended max image side.
+# 24 GB (A5000/RTX 4090) bumped to 2800 for Sony Alpha 50 MP quality.
+_VRAM_IMAGE_SIDE_TABLE: list[tuple[int, int]] = [
+    (48_000_000_000, 3200),   # A6000 / A100 / H100 class
+    (24_000_000_000, 2800),   # RTX 4090 / A5000 — 2800px fits comfortably in 24 GB
+    (16_000_000_000, 2200),   # RTX 4060 Ti 16 GB class
+    (12_000_000_000, 1800),   # RTX 3060 12 GB class
+    (0,              1600),   # 8-10 GB consumer cards
+]
+
 # Quality-preset multipliers. UI exposes only "Auto" / "Maximum".
-QUALITY_ITERATIONS = {"Auto": 30_000, "Maximum": 50_000}
-QUALITY_TARGET_MULT = {"Auto": 1.0, "Maximum": 1.25}
+QUALITY_ITERATIONS = {"Auto": 40_000, "Maximum": 100_000}
+QUALITY_TARGET_MULT = {"Auto": 1.0, "Maximum": 1.35}
 
 
 # ---------------------------------------------------------------------------
@@ -83,8 +93,9 @@ class Budget:
     target_splats: int                  # what we'll tell MCMCStrategy as cap_max
     iterations: int                     # total training iterations
     image_max_side: int                 # per-job image side cap (pixels)
-    downscale_factor: float             # 1.0 = full-res, 0.5 = half, etc.
+    downscale_factor: float             # 1.0 = full-res, 0.5 = half, etc.; MAX of all per-camera factors
     quality_preset: str
+    downscale_per_camera: list[float] = field(default_factory=list)  # per-camera downscale factors
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -171,6 +182,14 @@ def compute_target_splats(
     return target, exceeded
 
 
+def recommended_max_image_side(total_vram_bytes: int) -> int:
+    """Pick max_image_side from the GPU's VRAM class."""
+    for threshold, side in _VRAM_IMAGE_SIDE_TABLE:
+        if total_vram_bytes >= threshold:
+            return side
+    return _VRAM_IMAGE_SIDE_TABLE[-1][1]
+
+
 def compute_image_downscale(
     longest_side_px: int,
     *,
@@ -199,7 +218,7 @@ def compute_budget(
     image_sizes: Sequence[tuple[int, int]],
     dense_pts: int,
     quality_preset: str = "Auto",
-    max_image_side: int = DEFAULT_MAX_IMAGE_SIDE,
+    max_image_side: Optional[int] = None,
     safety: float = DEFAULT_VRAM_SAFETY,
     fixed_overhead_bytes: int = DEFAULT_FIXED_OVERHEAD_BYTES,
     per_splat_bytes: int = DEFAULT_PER_SPLAT_BYTES,
@@ -212,11 +231,14 @@ def compute_budget(
             returns in ``ParsedScene.image_sizes``.
         dense_pts: point count *after* voxel-downsample (from InitCloud.xyz).
         quality_preset: ``"Auto"`` or ``"Maximum"`` (see QUALITY_*).
-        max_image_side: longest image edge after downscale.
+        max_image_side: longest image edge after downscale. If None, picked
+            automatically from the GPU's VRAM class.
 
     Raises:
         ValueError on unknown preset, empty image list, or non-positive counts.
     """
+    if max_image_side is None:
+        max_image_side = recommended_max_image_side(gpu.total_vram_bytes)
     if quality_preset not in QUALITY_ITERATIONS:
         raise ValueError(
             f"unknown quality preset {quality_preset!r}; "
@@ -232,12 +254,15 @@ def compute_budget(
     side_used, downscale_factor = compute_image_downscale(
         longest_side, max_image_side=max_image_side,
     )
-    # Megapixel count after downscale (what actually feeds the trainer).
+    # Per-camera downscale: each camera is scaled independently to max_image_side.
+    downscale_per_camera = [
+        min(1.0, max_image_side / max(w, h)) if max(w, h) > max_image_side else 1.0
+        for w, h in image_sizes
+    ]
+    # Megapixel count after per-camera downscale (what actually feeds the trainer).
     total_mp = 0.0
-    for w, h in image_sizes:
-        eff_w = w * downscale_factor
-        eff_h = h * downscale_factor
-        total_mp += (eff_w * eff_h) / 1e6
+    for (w, h), ds in zip(image_sizes, downscale_per_camera):
+        total_mp += (w * ds * h * ds) / 1e6
 
     hard_cap = compute_hard_cap_splats(
         gpu.total_vram_bytes,
@@ -257,7 +282,8 @@ def compute_budget(
     if downscale_factor < 1.0:
         notes.append(
             f"Image longest side {longest_side}px > cap {max_image_side}px; "
-            f"downscaling by {downscale_factor:.3f} for training. "
+            f"downscaling from {longest_side}px to {max_image_side}px per camera "
+            f"(factor {downscale_factor:.3f} for the largest). "
             f"Final eval renders run at full resolution."
         )
     if exceeded:
@@ -278,6 +304,7 @@ def compute_budget(
         iterations=QUALITY_ITERATIONS[quality_preset],
         image_max_side=side_used,
         downscale_factor=downscale_factor,
+        downscale_per_camera=downscale_per_camera,
         quality_preset=quality_preset,
         notes=notes,
     )

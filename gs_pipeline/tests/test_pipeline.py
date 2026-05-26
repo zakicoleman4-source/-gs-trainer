@@ -50,7 +50,7 @@ GPU_24 = GPUInfo(name="(test) 24GB", total_vram_bytes=24_000_000_000)
 
 def _stub_train(
     *, scene: ParsedScene, init_cloud: InitCloud, budget: Budget,
-    config, config_yaml, job_state: JobState, job_state_path: Path,
+    config, job_state: JobState, job_state_path: Path,
     work_dir: Path, outbox_dir: Path,
 ) -> OutputsSnapshot:
     """Fake trainer: tick a few times, write a 5-splat scene.ply, return outputs.

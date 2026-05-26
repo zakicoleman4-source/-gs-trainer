@@ -10,8 +10,8 @@ quality:
   preset: Auto                  # "Auto" | "Maximum" — overridden by UI
 
 iterations:
-  Auto: 30000
-  Maximum: 50000
+  Auto: 40000       # bumped from 30k — more detail convergence time
+  Maximum: 100000   # bumped from 50k — publication-quality for A5000
 
 # Splat-budget heuristic (mirrors trainer/budget.py constants).
 budget:
@@ -19,27 +19,27 @@ budget:
   fixed_overhead_bytes: 3_000_000_000
   per_splat_bytes: 1280
   target_floor: 500_000
-  target_cap_ratio: 0.85
+  target_cap_ratio: 0.87         # bumped from 0.85 — use more VRAM headroom
   quality_target_mult:
     Auto: 1.0
-    Maximum: 1.25
-  max_image_side: 2000           # raise to e.g. 2600 on 48 GB cards via override
+    Maximum: 1.35                # bumped from 1.25 — push toward hard cap
+  max_image_side: 2000           # base; auto-overridden by VRAM class (24 GB → 2800)
 
 # Anti-Milky-Way defaults. These are the *quality* knobs.
 mcmc:
   noise_lr: 5.0e5                # gsplat MCMCStrategy default; per-mean noise scale
-  refine_start_iter: 500
-  refine_stop_iter_ratio: 0.85   # int(0.85 * iterations)
+  refine_start_iter: 100         # bumped from 500 — start densification much earlier
+  refine_stop_iter_ratio: 0.90   # bumped from 0.85 — densify longer before freeze
   refine_every: 100              # densify/relocate cadence
-  prune_opa: 0.005               # aggressive transparent-splat pruning
+  prune_opa: 0.003               # relaxed from 0.005 — preserve fine-detail splats
 
 sh:
   degree: 3
-  warmup_interval: 1500          # degree += 1 every N iters until cap
+  warmup_interval: 1000          # faster from 1500 — reach full SH-3 earlier
 
 regularization:
-  opacity_reg: 0.01              # kills semi-transparent floaters
-  scale_reg: 0.01                # kills oversized planar splats
+  opacity_reg: 0.005             # halved from 0.01 — less suppression = sharper detail
+  scale_reg: 0.005               # halved from 0.01 — allow tighter splat fitting
 
 init:
   init_opacity: 0.1
@@ -56,7 +56,7 @@ background:
 eval:
   holdout_stride: 8              # every Nth camera held out for PSNR/SSIM
   eval_every: 1000
-  preview_every: 1000
+  preview_every: 250
 
 checkpoint:
   every: 5000                    # write ckpt + intermediate .ply every N iters
@@ -64,13 +64,39 @@ checkpoint:
 divergence_abort:
   enabled: true
   min_psnr_at_step: 12.0
-  check_at_step: 10000
+  check_at_step: 15000           # bumped from 10k — more time before aborting slow scenes
 
 watchdog:
-  per_window_seconds: 1800       # 30-min watchdog; SIGTERM if no progress
+  per_window_seconds: 7200       # 2h; covers 100k-iter Maximum runs on A5000
   poll_interval_seconds: 30
+
+filter:
+  enabled: true
+  min_opacity: 0.005
+  sor_k: 20
+  sor_std_ratio: 2.0
+  max_scale_factor: 10.0
 
 oom:
   shrinkers:
     - halve_cap_max
     - halve_image_resolution
+
+timelapse:
+  enabled: true
+  fps: 10        # frames per second in output video
+  max_frames: 200   # cap: skip frames if more than this many were saved
+
+preview:
+  strip_width: 3     # number of panels in preview strip (left/center/right holdout cameras)
+  panel_height: 400  # pixels tall for each panel in the strip
+
+appearance:
+  enabled: false   # enable for drone footage with auto-exposure variation
+  lr: 0.01         # learning rate for per-camera exposure scalars
+
+large_scene:
+  threshold_cameras: 500          # scenes with >= this many cameras use block training
+  target_cameras_per_block: 150   # target cameras per spatial block
+  overlap_factor: 0.20            # fractional spatial overlap between adjacent blocks
+  visibility_threshold: 0.25      # min AABB projection coverage to assign a camera to a block

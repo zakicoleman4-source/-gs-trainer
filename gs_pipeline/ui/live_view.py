@@ -155,11 +155,16 @@ def render_live_dashboard(
             st.markdown("**Holdout PSNR / SSIM**")
             st.line_chart(df.set_index("step")[["holdout_psnr", "holdout_ssim"]])
 
-    # --- Live preview tile -----------------------------------------------
-    preview = js.outputs.preview_png
-    if preview and Path(preview).is_file():
+    # --- Live preview -----------------------------------------------
+    strip = getattr(js.outputs, 'preview_strip_png', None)
+    single = js.outputs.preview_png
+
+    if strip and Path(strip).is_file():
+        st.markdown("**Live render — 3 holdout views**")
+        st.image(strip, use_container_width=True)
+    elif single and Path(single).is_file():
         st.markdown("**Live render (one holdout view)**")
-        st.image(preview, use_container_width=True)
+        st.image(single, use_container_width=True)
 
     # --- Downloads --------------------------------------------------------
     work_dir = work_root / job_id
@@ -173,6 +178,19 @@ def render_live_dashboard(
                                 file_name=latest.name,
                                 mime="application/octet-stream",
                                 key=f"dl_mid_{latest.name}")
+
+    # Timelapse video
+    timelapse = getattr(js.outputs, 'timelapse_mp4', None)
+    if timelapse and Path(timelapse).is_file():
+        st.markdown("**Training timelapse video**")
+        with Path(timelapse).open("rb") as f:
+            st.download_button(
+                "Download training timelapse.mp4",
+                data=f.read(),
+                file_name="training_timelapse.mp4",
+                mime="video/mp4",
+                key="dl_timelapse",
+            )
 
     if js.state is State.DONE and js.outputs.final_ply:
         final = Path(js.outputs.final_ply)

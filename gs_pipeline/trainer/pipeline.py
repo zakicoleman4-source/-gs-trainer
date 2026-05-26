@@ -133,17 +133,66 @@ def run_job(
         scene, init_cloud, budget = _preflight(
             bundle_dir=bundle_dir, gpu=gpu, quality_preset=quality_preset,
         )
+
+        if budget.downscale_factor < 1.0:
+            # Pre-scale K matrices in-place so the training loop never needs to
+            # apply a per-camera factor: K[i] * ds_i once here is cheaper and
+            # cleaner than scaling at every training step.
+            import numpy as np
+            for i, ds in enumerate(budget.downscale_per_camera):
+                if ds < 1.0:
+                    scene.K_per_camera[i, :2, :] *= ds  # scale fx,cx and fy,cy rows
+
+            _log.info("Building image cache for %d cameras...", len(scene.image_paths))
+            from gs_pipeline.trainer.img_cache import build_image_cache
+            cached = build_image_cache(
+                image_paths=scene.image_paths,
+                downscale_per_camera=budget.downscale_per_camera,
+                work_dir=work_dir,
+            )
+            scene.image_paths = cached
+            # K matrices are now at training resolution; images are pre-sized.
+            # The training loop uses downscale=1.0 everywhere after this point.
+
         preflight = _preflight_snapshot(budget)
         js.start_training(preflight)
         write_state(js, state_path)
 
-        trainer = train_fn or _default_train_fn
-        outputs = trainer(
-            scene=scene, init_cloud=init_cloud, budget=budget,
-            config=None, config_yaml=config_yaml,
-            job_state=js, job_state_path=state_path,
-            work_dir=work_dir, outbox_dir=outbox_dir,
-        )
+        from gs_pipeline.trainer.train_mcmc import load_trainer_config, auto_adjust_config_for_scene
+        if config_yaml is not None:
+            _cfg = load_trainer_config(config_yaml)
+            _cfg = auto_adjust_config_for_scene(_cfg, n_cameras=len(scene))
+        else:
+            from gs_pipeline.trainer.train_mcmc import TrainerConfig
+            _cfg = auto_adjust_config_for_scene(TrainerConfig(), n_cameras=len(scene))
+
+        # Large-scene routing: when no custom train_fn is injected and the scene has
+        # >= 500 cameras, partition into spatial blocks and train each independently.
+        from gs_pipeline.trainer.scene_partition import should_partition
+        if train_fn is None and should_partition(len(scene)):
+            from gs_pipeline.trainer.large_scene import run_large_scene
+            _log.info(
+                "Large scene detected (%d cameras >= 500); using block-partitioned training.",
+                len(scene),
+            )
+            outputs = run_large_scene(
+                scene=scene,
+                init_cloud=init_cloud,
+                budget=budget,
+                config=_cfg,
+                job_state=js,
+                job_state_path=state_path,
+                work_dir=work_dir,
+                outbox_dir=outbox_dir,
+            )
+        else:
+            trainer = train_fn or _default_train_fn
+            outputs = trainer(
+                scene=scene, init_cloud=init_cloud, budget=budget,
+                config=_cfg,
+                job_state=js, job_state_path=state_path,
+                work_dir=work_dir, outbox_dir=outbox_dir,
+            )
         js.finish(outputs)
         write_state(js, state_path)
         _log.info("job %s done; outputs=%s", job_id, asdict(outputs))
@@ -214,6 +263,26 @@ def _preflight(
             f"{len(scene)} aligned cameras but only {len(scene.image_paths)} "
             f"images resolved under {images_dir}"
         )
+
+    # If the manifest declares undistorted images, downgrade distortion warnings
+    # from "re-export" to informational — the images are already clean.
+    manifest_path = bundle_dir / "manifest.json"
+    if manifest_path.is_file():
+        try:
+            import json
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if manifest.get("undistorted"):
+                scene.warnings = [
+                    w.replace(
+                        "the trainer assumes undistorted photos — re-export with "
+                        "File > Export > Undistort Photos.",
+                        "the trainer assumes undistorted photos. The bundle manifest "
+                        "declares undistorted=true, so this is likely fine.",
+                    )
+                    for w in scene.warnings
+                ]
+        except Exception:
+            pass
     init_cloud = load_and_downsample(dense_ply)
     gpu_info = gpu or detect_gpu()
     if gpu_info is None:
@@ -227,6 +296,20 @@ def _preflight(
         dense_pts=int(init_cloud.xyz.shape[0]),
         quality_preset=quality_preset,
     )
+
+    # Add small-scene quality warnings to budget notes
+    if len(scene) < 50:
+        budget.notes.append(
+            f"Only {len(scene)} cameras — sparse scene may limit reconstruction quality. "
+            f"100+ cameras recommended for high-quality splats."
+        )
+    pts_per_cam = int(init_cloud.xyz.shape[0]) / max(len(scene), 1)
+    if pts_per_cam < 200:
+        budget.notes.append(
+            f"Sparse reconstruction: {pts_per_cam:.0f} pts/camera (after downsample). "
+            f"Consider denser alignment settings in Metashape."
+        )
+
     return scene, init_cloud, budget
 
 
@@ -244,6 +327,7 @@ def _preflight_snapshot(budget: Budget) -> PreflightSnapshot:
         gpu_name=budget.gpu.name,
         gpu_total_vram_bytes=budget.gpu.total_vram_bytes,
         notes=list(budget.notes),
+        downscale_per_camera=[budget.downscale_factor] * budget.n_cameras,
     )
 
 

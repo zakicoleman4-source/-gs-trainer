@@ -7,8 +7,9 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from types import SimpleNamespace
 
-from gs_pipeline.trainer.render_eval import psnr, ssim
+from gs_pipeline.trainer.render_eval import psnr, ssim, _load_camera
 
 
 # ---------------------------------------------------------------------------
@@ -97,3 +98,31 @@ def test_render_view_requires_torch_and_gsplat():
             inputs, K=np.eye(3), w2c=np.eye(4),
             width=8, height=8, near_plane=0.1, far_plane=10.0,
         )
+
+
+# ---------------------------------------------------------------------------
+# _load_camera — K scaling (CPU-only, no rasterization)
+# ---------------------------------------------------------------------------
+
+def test_load_camera_scales_K_by_downscale():
+    """_load_camera must scale the K matrix when downscale < 1.0."""
+    K_native = np.array(
+        [[1000.0, 0.0, 500.0],
+         [0.0, 1000.0, 400.0],
+         [0.0,    0.0,   1.0]],
+        dtype=np.float64,
+    )
+    w2c_identity = np.eye(4, dtype=np.float64)
+    scene = SimpleNamespace(
+        K_per_camera=[K_native],
+        w2c_per_camera=[w2c_identity],
+        image_paths=["dummy_path.jpg"],
+    )
+
+    K, w2c, path = _load_camera(scene, 0, downscale=0.5)
+
+    assert K[0, 0].item() == pytest.approx(500.0)   # fx * 0.5
+    assert K[0, 2].item() == pytest.approx(250.0)   # cx * 0.5
+    assert K[1, 1].item() == pytest.approx(500.0)   # fy * 0.5
+    assert K[1, 2].item() == pytest.approx(200.0)   # cy * 0.5
+    assert K[2, 2].item() == pytest.approx(1.0)     # homogeneous row unchanged

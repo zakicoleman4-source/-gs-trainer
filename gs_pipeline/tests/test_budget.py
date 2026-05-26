@@ -189,12 +189,12 @@ def test_typical_scene_on_24gb_returns_sane_numbers():
         quality_preset="Auto",
     )
     assert b.n_cameras == 80
-    # Image side 4000 > 2000 cap -> downscale to 0.5.
-    assert b.image_max_side == 2000
-    assert b.downscale_factor == pytest.approx(0.5)
-    # total_mp after downscale = 80 * (2000*1500)/1e6 = 240 MP
-    assert b.total_megapixels == pytest.approx(240.0, rel=0.01)
-    # 12 * 1.5M dense = 18M; clipped at 0.85 * hard_cap_24gb ~12.5M
+    # 24 GB card auto-selects max_image_side=2800; images at 4000 get downscaled.
+    assert b.image_max_side == 2800
+    assert b.downscale_factor == pytest.approx(2800 / 4000, rel=0.01)
+    assert len(b.downscale_per_camera) == 80
+    assert all(abs(f - 2800 / 4000) < 0.01 for f in b.downscale_per_camera)
+    # 12 * 1.5M dense = 18M; clipped at 0.87 * hard_cap_24gb
     assert b.target_splats == int(b.hard_cap_splats * DEFAULT_TARGET_CAP_RATIO)
     assert any("exceeds VRAM budget" in n for n in b.notes)
     assert b.iterations == QUALITY_ITERATIONS["Auto"]
@@ -218,6 +218,7 @@ def test_simple_scene_under_full_budget_no_exceed_note():
         quality_preset="Auto",
     )
     assert b.downscale_factor == 1.0
+    assert all(f == 1.0 for f in b.downscale_per_camera)
     assert b.target_splats < b.hard_cap_splats * DEFAULT_TARGET_CAP_RATIO
     assert not any("exceeds VRAM budget" in n for n in b.notes)
 
@@ -281,3 +282,24 @@ def test_constants_used_consistently():
         per_splat_bytes=DEFAULT_PER_SPLAT_BYTES,
     )
     assert cap_default == cap_explicit
+
+
+def test_mixed_camera_sizes_per_camera_downscale():
+    """Sony Alpha (8000x6000) + GoPro (3840x2160) get independent downscale factors."""
+    b = compute_budget(
+        gpu=GPUInfo("RTX A5000", 24 * GB),
+        image_sizes=[(8000, 6000)] * 5 + [(3840, 2160)] * 10,
+        dense_pts=500_000,
+        quality_preset="Auto",
+    )
+    assert len(b.downscale_per_camera) == 15
+    # Sony cameras: scaled down from 8000 to 2800 (24 GB class → 2800 px)
+    assert all(
+        f == pytest.approx(2800 / 8000, rel=0.01) for f in b.downscale_per_camera[:5]
+    )
+    # GoPro cameras: scaled down from 3840 to 2800 (less severe than Sony)
+    assert all(
+        f == pytest.approx(2800 / 3840, rel=0.01) for f in b.downscale_per_camera[5:]
+    )
+    # Global downscale_factor is the smallest (Sony's, since 8000 >> 2800)
+    assert b.downscale_factor == pytest.approx(2800 / 8000, rel=0.01)

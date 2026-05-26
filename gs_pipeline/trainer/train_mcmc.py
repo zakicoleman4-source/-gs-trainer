@@ -60,8 +60,10 @@ from gs_pipeline.trainer.render_eval import (
     RenderInputs,
     _gather_sh,
     _load_camera,
+    _load_image_np,
     evaluate_holdout,
     psnr,
+    render_view,
     save_preview_png,
 )
 
@@ -74,16 +76,16 @@ _log = logging.getLogger(__name__)
 
 @dataclass
 class TrainerConfig:
-    iterations: int = 30_000
+    iterations: int = 40_000
     noise_lr: float = 5.0e5
-    refine_start_iter: int = 500
-    refine_stop_iter_ratio: float = 0.85
+    refine_start_iter: int = 100
+    refine_stop_iter_ratio: float = 0.90
     refine_every: int = 100
-    prune_opa: float = 0.005
+    prune_opa: float = 0.003
     sh_degree: int = 3
-    sh_warmup_interval: int = 1500
-    opacity_reg: float = 0.01
-    scale_reg: float = 0.01
+    sh_warmup_interval: int = 1000
+    opacity_reg: float = 0.005
+    scale_reg: float = 0.005
     init_opacity: float = 0.1
     init_scale_knn_k: int = 3
     near_plane_extent_ratio: float = 0.01
@@ -91,13 +93,24 @@ class TrainerConfig:
     random_bg_per_step: bool = True
     holdout_stride: int = 8
     eval_every: int = 1000
-    preview_every: int = 1000
+    preview_every: int = 250
     checkpoint_every: int = 5000
     divergence_min_psnr: float = 12.0
-    divergence_check_at_step: int = 10_000
+    divergence_check_at_step: int = 15_000
     memory_fraction: float = 0.92
-    # SSIM weight in the photometric loss: L = (1-lambda)*L1 + lambda*(1-SSIM).
     ssim_lambda: float = 0.2
+    watchdog_timeout_s: float = 7200.0
+    watchdog_poll_interval_s: float = 30.0
+    filter_enabled: bool = True
+    filter_min_opacity: float = 0.005
+    filter_sor_k: int = 20
+    filter_sor_std_ratio: float = 2.0
+    filter_max_scale_factor: float = 10.0
+    timelapse_enabled: bool = True
+    timelapse_fps: int = 10
+    preview_panel_height: int = 400
+    appearance_enabled: bool = False     # enable per-camera exposure compensation
+    appearance_lr: float = 0.01          # Adam learning rate for exposure scalars
 
 
 def load_trainer_config(yaml_path: Path, *, iterations_override: Optional[int] = None) -> TrainerConfig:
@@ -119,6 +132,11 @@ def load_trainer_config(yaml_path: Path, *, iterations_override: Optional[int] =
     ev = raw.get("eval", {})
     ck = raw.get("checkpoint", {})
     div = raw.get("divergence_abort", {})
+    wd = raw.get("watchdog", {})
+    filt = raw.get("filter", {})
+    tl = raw.get("timelapse", {})
+    pv = raw.get("preview", {})
+    app_cfg = raw.get("appearance", {})
 
     return TrainerConfig(
         iterations=iterations,
@@ -138,11 +156,53 @@ def load_trainer_config(yaml_path: Path, *, iterations_override: Optional[int] =
         random_bg_per_step=bool(bg.get("random_per_step", True)),
         holdout_stride=int(ev.get("holdout_stride", 8)),
         eval_every=int(ev.get("eval_every", 1000)),
-        preview_every=int(ev.get("preview_every", 1000)),
+        preview_every=int(ev.get("preview_every", 250)),
         checkpoint_every=int(ck.get("every", 5000)),
         divergence_min_psnr=float(div.get("min_psnr_at_step", 12.0)),
-        divergence_check_at_step=int(div.get("check_at_step", 10_000)),
+        divergence_check_at_step=int(div.get("check_at_step", 15_000)),
+        watchdog_timeout_s=float(wd.get("per_window_seconds", 7200.0)),
+        watchdog_poll_interval_s=float(wd.get("poll_interval_seconds", 30.0)),
+        filter_enabled=bool(filt.get("enabled", True)),
+        filter_min_opacity=float(filt.get("min_opacity", 0.005)),
+        filter_sor_k=int(filt.get("sor_k", 20)),
+        filter_sor_std_ratio=float(filt.get("sor_std_ratio", 2.0)),
+        filter_max_scale_factor=float(filt.get("max_scale_factor", 10.0)),
+        timelapse_enabled=bool(tl.get("enabled", True)),
+        timelapse_fps=int(tl.get("fps", 10)),
+        preview_panel_height=int(pv.get("panel_height", 400)),
+        appearance_enabled=bool(app_cfg.get("enabled", False)),
+        appearance_lr=float(app_cfg.get("lr", 0.01)),
     )
+
+
+def auto_adjust_config_for_scene(config: TrainerConfig, n_cameras: int) -> TrainerConfig:
+    """Auto-tune config settings based on camera count.
+
+    Small scenes need smaller holdout_stride (don't hold out too much data),
+    faster divergence detection, and lower splat cap (underconstrained geometry).
+    Large scenes need larger holdout_stride (evaluation is expensive).
+    """
+    from dataclasses import replace
+    if n_cameras < 30:
+        return replace(config,
+            holdout_stride=2,
+            divergence_check_at_step=3_000,
+            divergence_min_psnr=10.0,   # lower bar for tiny scenes
+        )
+    elif n_cameras < 80:
+        return replace(config,
+            holdout_stride=3,
+            divergence_check_at_step=6_000,
+        )
+    elif n_cameras < 150:
+        return replace(config, holdout_stride=5)
+    elif n_cameras > 1000:
+        # Large scenes: eval is expensive; do it less often
+        return replace(config,
+            holdout_stride=16,
+            eval_every=2000,
+        )
+    return config
 
 
 # ---------------------------------------------------------------------------
@@ -153,25 +213,69 @@ def knn_mean_distance(xyz: np.ndarray, k: int = 3) -> np.ndarray:
     """Per-point mean distance to its k nearest neighbors (excluding itself).
 
     Used to seed Gaussian scales: a splat in a dense region should be small,
-    a splat in a sparse region large. Pure NumPy, O(N^2) — fine for N <= 1M
-    since we only run it once at init.
+    a splat in a sparse region large.
+
+    Uses scipy's KDTree when available (O(N log N), memory-efficient) and
+    falls back to a blocked brute-force approach for small clouds or when
+    scipy is missing. The brute-force path builds (block, N, 3) intermediates
+    so it is only safe for N <= ~50k; for larger clouds without scipy, a
+    random subsample is used to estimate distances.
     """
     n = xyz.shape[0]
     if n <= 1:
         return np.full(n, 1e-3, dtype=np.float32)
-    # Block to avoid building an N x N matrix on huge clouds.
-    block = min(8192, n)
-    out = np.empty(n, dtype=np.float32)
-    for i in range(0, n, block):
-        chunk = xyz[i:i + block]                                # (B, 3)
-        diff = chunk[:, None, :] - xyz[None, :, :]              # (B, N, 3)
-        d2 = np.einsum("ijk,ijk->ij", diff, diff)               # (B, N)
-        # Replace self-distances with +inf, then take k smallest.
-        rows = np.arange(chunk.shape[0])
-        d2[rows, np.arange(i, i + chunk.shape[0])] = np.inf
-        # k smallest by partial sort.
-        k_eff = min(k, n - 1)
-        nearest = np.partition(d2, k_eff - 1, axis=1)[:, :k_eff]
+    k_eff = min(k, n - 1)
+
+    # Fast path: scipy KDTree — O(N log N) and memory-friendly.
+    try:
+        from scipy.spatial import KDTree
+        tree = KDTree(xyz)
+        # query k+1 because the closest neighbor is the point itself (distance 0).
+        dists, _ = tree.query(xyz, k=k_eff + 1)
+        # dists shape is (N, k_eff+1); drop the self-distance (column 0).
+        if dists.ndim == 1:
+            dists = dists[:, None]
+        return np.mean(dists[:, 1:], axis=1).astype(np.float32)
+    except ImportError:
+        pass
+
+    # Fallback: blocked brute-force. Safe for moderate N; for very large
+    # clouds, subsample to keep memory bounded (block * N * 3 * 4 bytes).
+    _MAX_BRUTEFORCE_N = 50_000
+    if n > _MAX_BRUTEFORCE_N:
+        # Subsample: build a small reference set for distance estimation,
+        # then use blocked queries against the subsample.
+        rng = np.random.default_rng(42)
+        ref_idx = rng.choice(n, size=_MAX_BRUTEFORCE_N, replace=False)
+        ref = xyz[ref_idx]
+        return _knn_mean_distance_bruteforce(xyz, ref, k_eff)
+    else:
+        return _knn_mean_distance_bruteforce(xyz, xyz, k_eff)
+
+
+def _knn_mean_distance_bruteforce(
+    query: np.ndarray,
+    reference: np.ndarray,
+    k: int,
+) -> np.ndarray:
+    """Blocked brute-force k-NN. ``query`` points are looked up against ``reference``."""
+    n_q = query.shape[0]
+    n_r = reference.shape[0]
+    same_set = query is reference
+    block = min(4096, n_q)
+    out = np.empty(n_q, dtype=np.float32)
+    for i in range(0, n_q, block):
+        chunk = query[i:i + block]                               # (B, 3)
+        diff = chunk[:, None, :] - reference[None, :, :]         # (B, N_r, 3)
+        d2 = np.einsum("ijk,ijk->ij", diff, diff)                # (B, N_r)
+        if same_set:
+            rows = np.arange(chunk.shape[0])
+            d2[rows, np.arange(i, i + chunk.shape[0])] = np.inf
+        k_safe = min(k, n_r - (1 if same_set else 0))
+        if k_safe <= 0:
+            out[i:i + block] = 1e-3
+            continue
+        nearest = np.partition(d2, k_safe - 1, axis=1)[:, :k_safe]
         out[i:i + block] = np.sqrt(np.mean(nearest, axis=1)).astype(np.float32)
     return out
 
@@ -269,6 +373,15 @@ def train(
         {"params": [sh_rest], "lr": 0.0025 / 20.0, "name": "sh_rest"},
     ])
 
+    # Per-camera appearance: learnable log-exposure (R, G, B) per image.
+    # Applied only to loss computation; discarded after training.
+    if config.appearance_enabled:
+        log_exposure = torch.zeros(len(scene), 3, device=device, requires_grad=True)
+        app_optimizer = torch.optim.Adam([log_exposure], lr=config.appearance_lr)
+    else:
+        log_exposure = None
+        app_optimizer = None
+
     strategy = MCMCStrategy(
         cap_max=int(budget.target_splats),
         noise_lr=config.noise_lr,
@@ -282,11 +395,24 @@ def train(
     near = init_cloud.scene_extent * config.near_plane_extent_ratio
     far = init_cloud.scene_extent * config.far_plane_extent_ratio
 
+    # --- Axis-flip auto-detect -----------------------------------------------
+    # Metashape chunks sometimes need a diag(1,-1,-1) flip on camera rotations.
+    # Render one training view both ways and pick whichever matches the GT.
+    _apply_axis_flip_if_needed(
+        means=means, scales=scales, quats=quats, opacities=opacities,
+        sh_dc=sh_dc, sh_rest=sh_rest, active_sh_degree=0,
+        full_sh_degree=config.sh_degree, scene=scene, train_idx=train_idx,
+        near=near, far=far, downscale=1.0, device=device,
+    )
+
     rng = np.random.default_rng(0)
     metrics_path = work_dir / "metrics.csv"
     metrics_path.write_text("step,loss,holdout_psnr,holdout_ssim\n", encoding="utf-8")
 
-    watchdog = ProgressWatchdog(timeout_s=1800.0, poll_interval_s=30.0)
+    # Timelapse: collect one preview strip frame per checkpoint for final MP4.
+    _timelapse_frames: list[Path] = []
+
+    watchdog = ProgressWatchdog(timeout_s=config.watchdog_timeout_s, poll_interval_s=config.watchdog_poll_interval_s)
     watchdog.start()
 
     try:
@@ -296,11 +422,14 @@ def train(
             active_sh_degree = max(active_sh_degree, target_deg)
 
             # Pick a training camera.
+            # K is pre-scaled by pipeline.py; images are pre-cached at training resolution.
             cam_i = int(train_idx[rng.integers(0, len(train_idx))])
             K, w2c, image_path = _load_camera(scene, cam_i)
-            target_img = _load_image_tensor(image_path, budget.downscale_factor, device)
+            target_img = _load_image_tensor(image_path, 1.0, device)  # pre-cached at training res
             mask_path = scene.mask_paths[cam_i] if scene.mask_paths else None
-            valid = _load_valid_mask(mask_path, budget.downscale_factor, device)
+            ds_cam = (budget.downscale_per_camera[cam_i] if budget.downscale_per_camera
+                      else budget.downscale_factor)
+            valid = _load_valid_mask(mask_path, ds_cam, device)
 
             bg = torch.rand(3, device=device) if config.random_bg_per_step else torch.zeros(3, device=device)
 
@@ -328,19 +457,23 @@ def train(
                 raise
 
             pred = colors[0]
+
+            # Apply per-camera exposure compensation to loss (not to the rendered output).
+            if log_exposure is not None:
+                pred_for_loss = pred * torch.exp(log_exposure[cam_i]).clamp(0.1, 10.0)
+            else:
+                pred_for_loss = pred
+
             if valid is not None:
                 # valid: (H,W,1) float32 tensor, 1=compute loss, 0=masked out.
-                # Zero masked pixels in both pred and target before loss so
-                # gradients are suppressed in excluded regions.
                 n_valid = valid.sum().clamp(min=1.0)
-                pred_m = pred * valid
+                pred_m = pred_for_loss * valid
                 target_m = target_img * valid
                 loss = (1.0 - config.ssim_lambda) * (pred_m - target_m).abs().sum() / n_valid
                 loss = loss + config.ssim_lambda * _ssim_loss(pred_m, target_m)
             else:
-                loss = (1.0 - config.ssim_lambda) * (pred - target_img).abs().mean()
-                # SSIM term (skipped if scikit-image unavailable at import time):
-                loss = loss + config.ssim_lambda * _ssim_loss(pred, target_img)
+                loss = (1.0 - config.ssim_lambda) * (pred_for_loss - target_img).abs().mean()
+                loss = loss + config.ssim_lambda * _ssim_loss(pred_for_loss, target_img)
 
             # Regularization (gsplat MCMC-style anti-floater terms).
             loss = loss + config.opacity_reg * torch.sigmoid(opacities).mean()
@@ -360,6 +493,10 @@ def train(
                 lr=0.00016 * init_cloud.scene_extent,
             )
 
+            if app_optimizer is not None:
+                app_optimizer.step()
+                app_optimizer.zero_grad(set_to_none=True)
+
             watchdog.tick(step)
 
             # Progress tick.
@@ -376,7 +513,7 @@ def train(
                 )
                 holdout_psnr, holdout_ssim = evaluate_holdout(
                     render_inputs, scene=scene, holdout_idx=holdout_idx,
-                    near_plane=near, far_plane=far, downscale=budget.downscale_factor,
+                    near_plane=near, far_plane=far, downscale=1.0,
                 )
                 with metrics_path.open("a", encoding="utf-8") as f:
                     f.write(f"{step},{float(loss.item()):.6f},{holdout_psnr:.4f},{holdout_ssim:.4f}\n")
@@ -403,11 +540,26 @@ def train(
                     sh_dc=sh_dc, sh_rest=sh_rest,
                     sh_degree=active_sh_degree, full_sh_degree=config.sh_degree,
                 )
-                save_preview_png(
+                strip_path = work_dir / "preview_strip.png"
+                from gs_pipeline.trainer.render_eval import save_preview_strip
+                save_preview_strip(
                     preview_inputs, scene=scene, holdout_idx=holdout_idx,
-                    near_plane=near, far_plane=far, downscale=budget.downscale_factor,
-                    out_path=work_dir / "preview.png",
+                    near_plane=near, far_plane=far, downscale=1.0,
+                    out_path=strip_path,
+                    target_height_px=config.preview_panel_height,
                 )
+                # Expose the strip to the live dashboard immediately.
+                job_state.outputs.preview_strip_png = str(strip_path)
+                job_state.outputs.preview_png = str(strip_path)
+                write_state(job_state, job_state_path)
+                # Archive one frame per checkpoint window for the timelapse.
+                if step % config.checkpoint_every == 0 and config.timelapse_enabled:
+                    import shutil as _shutil
+                    tl_dir = work_dir / "timelapse_frames"
+                    tl_dir.mkdir(exist_ok=True)
+                    frame = tl_dir / f"strip_{step:06d}.png"
+                    _shutil.copy2(strip_path, frame)
+                    _timelapse_frames.append(frame)
 
             if step % config.checkpoint_every == 0:
                 ckpt = work_dir / f"ckpt_{step}.pt"
@@ -436,7 +588,7 @@ def train(
                 write_state(job_state, job_state_path)
 
         # Clean finish.
-        from gs_pipeline.trainer.export_ply import write_inria_ply  # local import
+        from gs_pipeline.trainer.export_ply import write_inria_ply, read_inria_ply  # local import
         final_ply = outbox_dir / "scene.ply"
         outbox_dir.mkdir(parents=True, exist_ok=True)
         write_inria_ply(
@@ -449,20 +601,76 @@ def train(
             sh_rest=sh_rest.detach().cpu().numpy(),
         )
 
+        # --- Post-training filter ------------------------------------------------
+        filter_report_dict: dict[str, Any] = {}
+        if config.filter_enabled:
+            from gs_pipeline.trainer.filter_splats import filter_scene  # local import
+            loaded = read_inria_ply(final_ply)
+            (
+                f_means, f_scales, f_quats, f_opacities, f_sh_dc, f_sh_rest,
+                f_report,
+            ) = filter_scene(
+                means=loaded.means,
+                scales=loaded.scales,
+                quats=loaded.quats,
+                opacities=loaded.opacities,
+                sh_dc=loaded.sh_dc,
+                sh_rest=loaded.sh_rest,
+                scene_extent=init_cloud.scene_extent,
+                min_opacity=config.filter_min_opacity,
+                sor_k=config.filter_sor_k,
+                sor_std_ratio=config.filter_sor_std_ratio,
+                max_scale_factor=config.filter_max_scale_factor,
+            )
+            _log.info("Post-training filter:\n%s", f_report.summary)
+            # Save unfiltered backup, then overwrite with filtered.
+            unfiltered_ply = outbox_dir / "scene_unfiltered.ply"
+            import shutil as _shutil
+            _shutil.copy2(str(final_ply), str(unfiltered_ply))
+            write_inria_ply(
+                out_path=final_ply,
+                means=f_means,
+                scales=f_scales,
+                quats=f_quats,
+                opacities=f_opacities,
+                sh_dc=f_sh_dc,
+                sh_rest=f_sh_rest,
+            )
+            filter_report_dict = {
+                "n_input": f_report.n_input,
+                "n_after_opacity": f_report.n_after_opacity,
+                "n_after_scale": f_report.n_after_scale,
+                "n_after_sor": f_report.n_after_sor,
+                "n_output": f_report.n_output,
+                "summary": f_report.summary,
+            }
+
         report = {
             "job_id": job_state.job_id,
             "final_step": config.iterations,
             "final_splat_count": int(means.shape[0]),
             "preflight": job_state.preflight.__dict__ if job_state.preflight else None,
+            "filter": filter_report_dict if filter_report_dict else None,
         }
         (work_dir / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
 
+        # Compile timelapse if we collected frames.
+        timelapse_path: Optional[str] = None
+        if config.timelapse_enabled and _timelapse_frames:
+            tl_out = outbox_dir / "training_timelapse.mp4"
+            if _compile_timelapse(_timelapse_frames, tl_out, fps=config.timelapse_fps):
+                timelapse_path = str(tl_out)
+                _log.info("timelapse written: %s", tl_out)
+
+        strip_str = str(work_dir / "preview_strip.png")
         return OutputsSnapshot(
             checkpoints=job_state.outputs.checkpoints,
-            preview_png=str(work_dir / "preview.png"),
+            preview_png=strip_str,
+            preview_strip_png=strip_str,
             final_ply=str(final_ply),
             metrics_csv=str(metrics_path),
             report_json=str(work_dir / "report.json"),
+            timelapse_mp4=timelapse_path,
         )
     finally:
         watchdog.stop()
@@ -519,8 +727,8 @@ def _load_valid_mask(mask_path, downscale: float, device):
         img = Image.open(mask_path).convert("L")
         w, h = img.size
         if downscale != 1.0:
-            nw = max(1, int(w / downscale))
-            nh = max(1, int(h / downscale))
+            nw = max(1, int(w * downscale))
+            nh = max(1, int(h * downscale))
             img = img.resize((nw, nh), Image.NEAREST)
         arr = np.array(img, dtype=np.float32) / 255.0
         # Invert: Metashape white=excluded → we want 0=excluded, 1=valid.
@@ -530,20 +738,35 @@ def _load_valid_mask(mask_path, downscale: float, device):
         return None
 
 
-def _ssim_loss(pred, target):
-    """SSIM-weighted L1 loss: computes per-pixel SSIM map via skimage, uses it
-    to weight the L1 term so gradients flow back through pred. Falls back to
-    plain L2 if skimage is unavailable."""
-    try:
-        from skimage.metrics import structural_similarity as sk_ssim
-    except Exception:
-        return ((pred - target) ** 2).mean()
+def _ssim_loss(pred, target, window_size: int = 11):
+    """Differentiable SSIM loss (1 - SSIM) via Gaussian-windowed convolutions on GPU."""
     import torch
-    p = pred.detach().cpu().numpy()
-    t = target.detach().cpu().numpy()
-    _, ssim_map = sk_ssim(t, p, channel_axis=-1, data_range=1.0, full=True)
-    ssim_map_t = torch.from_numpy(ssim_map.astype("float32")).to(pred.device)
-    return ((1.0 - ssim_map_t).unsqueeze(-1) * (pred - target).abs()).mean()
+    import torch.nn.functional as F
+
+    C1 = 0.01 ** 2
+    C2 = 0.03 ** 2
+
+    pred_4d = pred.permute(2, 0, 1).unsqueeze(0)
+    target_4d = target.permute(2, 0, 1).unsqueeze(0)
+
+    coords = torch.arange(window_size, dtype=pred.dtype, device=pred.device) - window_size // 2
+    gauss_1d = torch.exp(-coords.pow(2) / (2.0 * 1.5 ** 2))
+    gauss_1d = gauss_1d / gauss_1d.sum()
+    kernel_2d = gauss_1d.unsqueeze(1) * gauss_1d.unsqueeze(0)
+    kernel = kernel_2d.unsqueeze(0).unsqueeze(0).expand(3, 1, -1, -1).contiguous()
+
+    pad = window_size // 2
+    mu1 = F.conv2d(pred_4d, kernel, padding=pad, groups=3)
+    mu2 = F.conv2d(target_4d, kernel, padding=pad, groups=3)
+    mu1_sq, mu2_sq, mu12 = mu1.pow(2), mu2.pow(2), mu1 * mu2
+
+    sigma1_sq = F.conv2d(pred_4d.pow(2), kernel, padding=pad, groups=3) - mu1_sq
+    sigma2_sq = F.conv2d(target_4d.pow(2), kernel, padding=pad, groups=3) - mu2_sq
+    sigma12 = F.conv2d(pred_4d * target_4d, kernel, padding=pad, groups=3) - mu12
+
+    ssim_map = ((2.0 * mu12 + C1) * (2.0 * sigma12 + C2)) / \
+               ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+    return 1.0 - ssim_map.mean()
 
 
 def _tick(job_state: JobState, path: Path, *, step: int, splats: int, loss: float) -> None:
@@ -555,3 +778,86 @@ def _tick(job_state: JobState, path: Path, *, step: int, splats: int, loss: floa
 def _add_checkpoint(job_state: JobState, ckpt_path: str) -> None:
     if ckpt_path not in job_state.outputs.checkpoints:
         job_state.outputs.checkpoints.append(ckpt_path)
+
+
+def _compile_timelapse(frame_paths: list[Path], out_path: Path, fps: int = 10) -> bool:
+    """Compile preview strip PNGs into an MP4 via ffmpeg. Returns True on success."""
+    import shutil
+    import subprocess
+    if not frame_paths or shutil.which("ffmpeg") is None:
+        return False
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    list_file = out_path.parent / "_timelapse_list.txt"
+    try:
+        with list_file.open("w", encoding="utf-8") as f:
+            for p in frame_paths:
+                f.write(f"file '{p.absolute()}'\n")
+                f.write(f"duration {1.0 / fps:.4f}\n")
+            # Repeat last frame so ffmpeg concat doesn't drop it.
+            f.write(f"file '{frame_paths[-1].absolute()}'\n")
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                "-i", str(list_file),
+                "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "23",
+                str(out_path),
+            ],
+            capture_output=True, timeout=300,
+        )
+        return result.returncode == 0
+    except Exception as exc:
+        _log.warning("timelapse compilation failed: %s", exc)
+        return False
+    finally:
+        list_file.unlink(missing_ok=True)
+
+
+def _apply_axis_flip_if_needed(
+    *, means, scales, quats, opacities, sh_dc, sh_rest,
+    active_sh_degree, full_sh_degree, scene, train_idx,
+    near, far, downscale, device,
+) -> None:
+    """Render one training view with and without a camera-axis flip; apply if it helps.
+
+    ``downscale`` should be 1.0 when K is already pre-scaled by pipeline.py.
+    """
+    import torch
+
+    cam_i = train_idx[0]
+    K, w2c, image_path = _load_camera(scene, cam_i)
+    target_np = _load_image_np(image_path, downscale)
+    target = torch.from_numpy(target_np).to(device)
+    h, w = target.shape[:2]
+
+    ri = RenderInputs(
+        means=means, scales=scales, quats=quats, opacities=opacities,
+        sh_dc=sh_dc, sh_rest=sh_rest,
+        sh_degree=active_sh_degree, full_sh_degree=full_sh_degree,
+    )
+
+    flip_mat = torch.diag(torch.tensor([1.0, -1.0, -1.0, 1.0], device=device))
+
+    with torch.no_grad():
+        pred_no_flip, _ = render_view(
+            ri, K=K.to(device), w2c=w2c.to(device),
+            width=w, height=h, near_plane=near, far_plane=far,
+        )
+        w2c_flipped = (flip_mat @ w2c.to(device)).float()
+        pred_flipped, _ = render_view(
+            ri, K=K.to(device), w2c=w2c_flipped,
+            width=w, height=h, near_plane=near, far_plane=far,
+        )
+
+    needs_flip = detect_camera_axis_flip(
+        rendered_no_flip=pred_no_flip.cpu().numpy(),
+        rendered_flipped=pred_flipped.cpu().numpy(),
+        target=target_np,
+    )
+
+    if needs_flip:
+        _log.warning("axis-flip auto-detect: applying diag(1,-1,-1) to all w2c matrices")
+        flip_np = np.diag([1.0, -1.0, -1.0, 1.0])
+        scene.w2c_per_camera = (flip_np @ scene.w2c_per_camera).astype(np.float64)
+    else:
+        _log.info("axis-flip auto-detect: no flip needed")

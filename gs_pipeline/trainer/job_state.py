@@ -93,6 +93,7 @@ class PreflightSnapshot:
     gpu_name: str
     gpu_total_vram_bytes: int
     notes: list[str] = field(default_factory=list)
+    downscale_per_camera: list[float] = field(default_factory=list)
 
 
 @dataclass
@@ -109,6 +110,8 @@ class ProgressSnapshot:
 class OutputsSnapshot:
     checkpoints: list[str] = field(default_factory=list)
     preview_png: Optional[str] = None
+    preview_strip_png: Optional[str] = None   # path to latest 3-panel strip
+    timelapse_mp4: Optional[str] = None       # path to training timelapse (written at end)
     final_ply: Optional[str] = None
     metrics_csv: Optional[str] = None
     report_json: Optional[str] = None

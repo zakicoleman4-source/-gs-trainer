@@ -135,15 +135,15 @@ def test_load_trainer_config_defaults_match_yaml(tmp_path: Path):
     assert cfg_path.is_file(), "missing shipped config.yaml"
     cfg = load_trainer_config(cfg_path)
     assert isinstance(cfg, TrainerConfig)
-    assert cfg.iterations == 30_000             # Auto preset
+    assert cfg.iterations == 40_000             # Auto preset
     assert cfg.sh_degree == 3
-    assert cfg.sh_warmup_interval == 1500
-    assert cfg.opacity_reg == 0.01
-    assert cfg.scale_reg == 0.01
-    assert cfg.prune_opa == 0.005
-    assert cfg.refine_start_iter == 500
+    assert cfg.sh_warmup_interval == 1000
+    assert cfg.opacity_reg == 0.005
+    assert cfg.scale_reg == 0.005
+    assert cfg.prune_opa == 0.003
+    assert cfg.refine_start_iter == 100
     assert cfg.eval_every == 1000
-    assert cfg.preview_every == 1000
+    assert cfg.preview_every == 250
     assert cfg.checkpoint_every == 5000
     assert cfg.holdout_stride == 8
 
@@ -160,4 +160,29 @@ def test_load_trainer_config_maximum_preset_iterations(tmp_path: Path):
     mutated = tmp_path / "cfg.yaml"
     mutated.write_text(src.replace("preset: Auto", "preset: Maximum"), encoding="utf-8")
     cfg = load_trainer_config(mutated)
-    assert cfg.iterations == 50_000
+    assert cfg.iterations == 100_000
+
+
+def test_auto_adjust_config_small_scene():
+    from gs_pipeline.trainer.train_mcmc import auto_adjust_config_for_scene, TrainerConfig
+    base = TrainerConfig()
+    # Very small scene gets tighter holdout
+    tiny = auto_adjust_config_for_scene(base, n_cameras=20)
+    assert tiny.holdout_stride == 2
+    assert tiny.divergence_check_at_step == 3_000
+
+
+def test_auto_adjust_config_medium_scene_unchanged():
+    from gs_pipeline.trainer.train_mcmc import auto_adjust_config_for_scene, TrainerConfig
+    base = TrainerConfig()
+    medium = auto_adjust_config_for_scene(base, n_cameras=200)
+    assert medium.holdout_stride == base.holdout_stride
+    assert medium.eval_every == base.eval_every
+
+
+def test_auto_adjust_config_large_scene():
+    from gs_pipeline.trainer.train_mcmc import auto_adjust_config_for_scene, TrainerConfig
+    base = TrainerConfig()
+    large = auto_adjust_config_for_scene(base, n_cameras=1500)
+    assert large.holdout_stride == 16
+    assert large.eval_every == 2000
