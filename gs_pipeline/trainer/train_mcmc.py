@@ -335,12 +335,12 @@ def train(
             loss = loss + config.scale_reg * torch.exp(scales).mean()
 
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
 
             strategy.step_pre_backward(
                 params=_strategy_params(means, scales, quats, opacities, sh_dc, sh_rest),
                 optimizers=optimizer, state=strategy_state, step=step, info=info,
             )
+            loss.backward()
             optimizer.step()
             strategy.step_post_backward(
                 params=_strategy_params(means, scales, quats, opacities, sh_dc, sh_rest),
@@ -492,7 +492,9 @@ def _load_image_tensor(image_path: Path, downscale: float, device):
 
 
 def _ssim_loss(pred, target):
-    """Differentiable-ish SSIM loss term: ``1 - SSIM`` (skimage path) or L2 fallback."""
+    """SSIM-weighted L1 loss: computes per-pixel SSIM map via skimage, uses it
+    to weight the L1 term so gradients flow back through pred. Falls back to
+    plain L2 if skimage is unavailable."""
     try:
         from skimage.metrics import structural_similarity as sk_ssim
     except Exception:
@@ -500,8 +502,9 @@ def _ssim_loss(pred, target):
     import torch
     p = pred.detach().cpu().numpy()
     t = target.detach().cpu().numpy()
-    s = float(sk_ssim(t, p, channel_axis=-1, data_range=1.0))
-    return (1.0 - s) * torch.ones((), device=pred.device, requires_grad=True)
+    _, ssim_map = sk_ssim(t, p, channel_axis=-1, data_range=1.0, full=True)
+    ssim_map_t = torch.from_numpy(ssim_map.astype("float32")).to(pred.device)
+    return ((1.0 - ssim_map_t).unsqueeze(-1) * (pred - target).abs()).mean()
 
 
 def _tick(job_state: JobState, path: Path, *, step: int, splats: int, loss: float) -> None:

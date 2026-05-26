@@ -113,9 +113,10 @@ def write_inria_ply(
     data["f_dc_0"] = sh_dc[:, 0]; data["f_dc_1"] = sh_dc[:, 1]; data["f_dc_2"] = sh_dc[:, 2]
 
     # Channel-major rest: (N, K, 3) -> (N, 3, K) -> (N, 3*K)
-    rest_cm = np.transpose(sh_rest, (0, 2, 1)).reshape(n, -1)
-    for idx, name in enumerate(rest_names):
-        data[name] = rest_cm[:, idx]
+    if n > 0 and rest_names:
+        rest_cm = np.transpose(sh_rest, (0, 2, 1)).reshape(n, -1)
+        for idx, name in enumerate(rest_names):
+            data[name] = rest_cm[:, idx]
 
     data["opacity"] = opacities
     data["scale_0"] = scales[:, 0]; data["scale_1"] = scales[:, 1]; data["scale_2"] = scales[:, 2]
