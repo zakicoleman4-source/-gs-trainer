@@ -21,7 +21,6 @@ services:
     environment:
       MAX_UPLOAD_GB: "20"
       QUALITY_PRESET_DEFAULT: "Auto"
-      MAX_IMAGE_SIDE: "2000"
     # NVIDIA GPU passthrough. Requires `nvidia-container-toolkit` on the host
     # and Docker 20.10+; the older `runtime: nvidia` form also works.
     deploy:

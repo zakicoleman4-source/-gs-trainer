@@ -35,9 +35,12 @@ The `test_set_memory_fraction` test fails when CUDA is present (expects no-GPU).
 The `test_ui` tests require streamlit.
 
 ## Docker
-- Image: `swdsfd/gs-trainer:edge` on Docker Hub (7.95 GB, linux/amd64)
+- Image: `swdsfd/gs-trainer:edge` on Docker Hub (linux/amd64)
 - Run: `docker run --gpus all -p 8501:8501 -v inbox:/data/inbox -v outbox:/data/outbox -v logs:/data/logs -v work:/data/work swdsfd/gs-trainer:edge`
 - Tag a release: `git tag v0.1.0 && git push origin v0.1.0` -> workflow pushes :v0.1.0, :latest
+- GPU arch support: `7.0;7.5;8.0;8.6;8.9;9.0` (Volta V100, Turing RTX 2000/T4, Ampere, Ada, Hopper)
+- ffmpeg is installed in the image (required for timelapse MP4 generation)
+- `MAX_IMAGE_SIDE` is NOT set in docker-compose.yml — budget.py picks it from VRAM at runtime
 
 ## Key architectural decisions
 
@@ -89,6 +92,18 @@ Per-camera log-exposure (3 RGB scalars) for drone footage with auto-exposure var
 Disabled by default (`appearance.enabled: false` in config.yaml). Applied only to
 the photometric loss; discarded from final PLY.
 
+### Post-training filter (`filter_splats.py`)
+Three-stage chain applied after training when `filter.enabled: true` (default on):
+1. **Opacity** — drops splats with `sigmoid(logit) < filter.min_opacity` (default 0.005)
+2. **Scale** — drops splats whose max axis scale exceeds `filter.max_scale_factor × median_scale`
+3. **SOR** — statistical outlier removal via k-NN (k=`filter.sor_k`, cutoff at
+   `mean_dist + sor_std_ratio × std_dist`). Uses `scipy.spatial.KDTree` (O(N log N));
+   falls back to brute-force block multiply for N ≤ 50k when scipy is absent.
+
+Pipeline saves `scene_unfiltered.ply` as backup before overwriting `scene.ply`.
+All filter params live under `filter:` in `config.yaml`; all default to sensible values.
+scipy is required for SOR on large scenes — it is in `requirements-cpu.txt` (≥ 1.12).
+
 ## VRAM class → max_image_side table (budget.py)
 | VRAM      | max_image_side |
 |-----------|---------------|
@@ -125,7 +140,7 @@ The pipeline should produce publication-quality splats with zero manual tuning.
 
 ## Pending work
 - UI preflight screen: show large-scene mode info (block count, cameras per block)
-- Git commit + push + Docker rebuild before client's first real run
+- UI filter comparison view: show before/after splat counts + per-filter breakdown in job dashboard
 - Validate `export_for_splat.py` Metashape script on actual Metashape Pro install
 
 ## Repo
