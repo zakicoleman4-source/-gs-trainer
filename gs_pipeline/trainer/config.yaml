@@ -40,6 +40,13 @@ sh:
 regularization:
   opacity_reg: 0.005             # halved from 0.01 — less suppression = sharper detail
   scale_reg: 0.005               # halved from 0.01 — allow tighter splat fitting
+  depth_reg_weight: 0.001        # edge-aware depth smoothness; 0 to disable
+
+rasterizer:
+  antialias: true                # rasterize_mode="antialiased" — Mip-Splatting quality
+
+means_lr:
+  final_factor: 0.01             # means LR decays exponentially to init_lr * this
 
 init:
   init_opacity: 0.1

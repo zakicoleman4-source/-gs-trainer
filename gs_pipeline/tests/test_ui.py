@@ -56,7 +56,7 @@ def test_run_preflight_happy(synth_zip: Path, tmp_path: Path):
     assert report.n_cameras == 6
     assert report.dense_pts_after_downsample > 0
     assert report.target_splats >= 500_000  # floor
-    assert report.iterations == 30_000
+    assert report.iterations == 40_000
     assert report.gpu_name == GPU_24.name
 
 

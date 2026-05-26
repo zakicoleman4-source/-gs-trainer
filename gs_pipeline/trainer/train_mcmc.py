@@ -111,6 +111,9 @@ class TrainerConfig:
     preview_panel_height: int = 400
     appearance_enabled: bool = False     # enable per-camera exposure compensation
     appearance_lr: float = 0.01          # Adam learning rate for exposure scalars
+    antialias: bool = True               # rasterize_mode="antialiased" (Mip-Splatting)
+    means_lr_final_factor: float = 0.01  # exponential decay: ends at init_lr * this
+    depth_reg_weight: float = 0.001      # edge-aware depth smoothness; 0 to disable
 
 
 def load_trainer_config(yaml_path: Path, *, iterations_override: Optional[int] = None) -> TrainerConfig:
@@ -137,6 +140,8 @@ def load_trainer_config(yaml_path: Path, *, iterations_override: Optional[int] =
     tl = raw.get("timelapse", {})
     pv = raw.get("preview", {})
     app_cfg = raw.get("appearance", {})
+    rasterizer_cfg = raw.get("rasterizer", {})
+    means_lr_cfg = raw.get("means_lr", {})
 
     return TrainerConfig(
         iterations=iterations,
@@ -172,6 +177,9 @@ def load_trainer_config(yaml_path: Path, *, iterations_override: Optional[int] =
         preview_panel_height=int(pv.get("panel_height", 400)),
         appearance_enabled=bool(app_cfg.get("enabled", False)),
         appearance_lr=float(app_cfg.get("lr", 0.01)),
+        antialias=bool(rasterizer_cfg.get("antialias", True)),
+        means_lr_final_factor=float(means_lr_cfg.get("final_factor", 0.01)),
+        depth_reg_weight=float(reg.get("depth_reg_weight", 0.001)),
     )
 
 
@@ -406,6 +414,7 @@ def train(
     )
 
     rng = np.random.default_rng(0)
+    means_lr_init = 0.00016 * init_cloud.scene_extent
     metrics_path = work_dir / "metrics.csv"
     metrics_path.write_text("step,loss,holdout_psnr,holdout_ssim\n", encoding="utf-8")
 
@@ -436,6 +445,15 @@ def train(
             # Compose SH = [dc, rest[:active_dim]]
             sh_active = _gather_sh(sh_dc, sh_rest, active_sh_degree, config.sh_degree)
 
+            # Exponential means LR decay: full rate early, 1% of init by final step.
+            lr_means = _means_lr_at_step(
+                step, config.iterations, means_lr_init, config.means_lr_final_factor,
+            )
+            for pg in optimizer.param_groups:
+                if pg["name"] == "means":
+                    pg["lr"] = lr_means
+                    break
+
             try:
                 colors, alphas, info = rasterization(
                     means=means,
@@ -451,12 +469,15 @@ def train(
                     far_plane=far,
                     backgrounds=bg[None],
                     sh_degree=active_sh_degree,
+                    render_mode="RGB+D",
+                    rasterize_mode="antialiased" if config.antialias else "classic",
                 )
             except torch.cuda.OutOfMemoryError:
                 clear_cuda_cache()
                 raise
 
-            pred = colors[0]
+            pred = colors[0, :, :, :3]    # (H, W, 3) RGB
+            depth = colors[0, :, :, 3:4]  # (H, W, 1) camera-space depth
 
             # Apply per-camera exposure compensation to loss (not to the rendered output).
             if log_exposure is not None:
@@ -466,11 +487,13 @@ def train(
 
             if valid is not None:
                 # valid: (H,W,1) float32 tensor, 1=compute loss, 0=masked out.
+                # L1 on zeroed-masked pixels; SSIM computed on full image with mask
+                # applied per-pixel so the convolution window stays clean.
                 n_valid = valid.sum().clamp(min=1.0)
                 pred_m = pred_for_loss * valid
                 target_m = target_img * valid
                 loss = (1.0 - config.ssim_lambda) * (pred_m - target_m).abs().sum() / n_valid
-                loss = loss + config.ssim_lambda * _ssim_loss(pred_m, target_m)
+                loss = loss + config.ssim_lambda * _ssim_loss(pred_for_loss, target_img, mask=valid)
             else:
                 loss = (1.0 - config.ssim_lambda) * (pred_for_loss - target_img).abs().mean()
                 loss = loss + config.ssim_lambda * _ssim_loss(pred_for_loss, target_img)
@@ -478,6 +501,9 @@ def train(
             # Regularization (gsplat MCMC-style anti-floater terms).
             loss = loss + config.opacity_reg * torch.sigmoid(opacities).mean()
             loss = loss + config.scale_reg * torch.exp(scales).mean()
+            if config.depth_reg_weight > 0.0:
+                depth_norm = depth / max(float(init_cloud.scene_extent), 1e-6)
+                loss = loss + config.depth_reg_weight * _depth_smooth_loss(depth_norm, target_img)
 
             optimizer.zero_grad(set_to_none=True)
 
@@ -490,7 +516,7 @@ def train(
             strategy.step_post_backward(
                 params=_strategy_params(means, scales, quats, opacities, sh_dc, sh_rest),
                 optimizers=optimizer, state=strategy_state, step=step, info=info,
-                lr=0.00016 * init_cloud.scene_extent,
+                lr=lr_means,
             )
 
             if app_optimizer is not None:
@@ -738,13 +764,19 @@ def _load_valid_mask(mask_path, downscale: float, device):
         return None
 
 
-def _ssim_loss(pred, target, window_size: int = 11):
-    """Differentiable SSIM loss (1 - SSIM) via Gaussian-windowed convolutions on GPU."""
+def _ssim_loss(pred, target, *, mask=None, window_size: int = 11):
+    """Differentiable SSIM loss (1 - SSIM) via Gaussian-windowed convolutions on GPU.
+
+    mask: optional (H, W, 1) validity tensor (1=valid, 0=masked). When provided,
+    the per-pixel SSIM loss is averaged only over valid pixels — the convolution
+    window is computed on the full image so masked regions don't corrupt neighbors.
+    """
     import torch
     import torch.nn.functional as F
 
     C1 = 0.01 ** 2
     C2 = 0.03 ** 2
+    channels = pred.shape[-1]
 
     pred_4d = pred.permute(2, 0, 1).unsqueeze(0)
     target_4d = target.permute(2, 0, 1).unsqueeze(0)
@@ -753,20 +785,49 @@ def _ssim_loss(pred, target, window_size: int = 11):
     gauss_1d = torch.exp(-coords.pow(2) / (2.0 * 1.5 ** 2))
     gauss_1d = gauss_1d / gauss_1d.sum()
     kernel_2d = gauss_1d.unsqueeze(1) * gauss_1d.unsqueeze(0)
-    kernel = kernel_2d.unsqueeze(0).unsqueeze(0).expand(3, 1, -1, -1).contiguous()
+    kernel = kernel_2d.unsqueeze(0).unsqueeze(0).expand(channels, 1, -1, -1).contiguous()
 
     pad = window_size // 2
-    mu1 = F.conv2d(pred_4d, kernel, padding=pad, groups=3)
-    mu2 = F.conv2d(target_4d, kernel, padding=pad, groups=3)
+    mu1 = F.conv2d(pred_4d, kernel, padding=pad, groups=channels)
+    mu2 = F.conv2d(target_4d, kernel, padding=pad, groups=channels)
     mu1_sq, mu2_sq, mu12 = mu1.pow(2), mu2.pow(2), mu1 * mu2
 
-    sigma1_sq = F.conv2d(pred_4d.pow(2), kernel, padding=pad, groups=3) - mu1_sq
-    sigma2_sq = F.conv2d(target_4d.pow(2), kernel, padding=pad, groups=3) - mu2_sq
-    sigma12 = F.conv2d(pred_4d * target_4d, kernel, padding=pad, groups=3) - mu12
+    sigma1_sq = F.conv2d(pred_4d.pow(2), kernel, padding=pad, groups=channels) - mu1_sq
+    sigma2_sq = F.conv2d(target_4d.pow(2), kernel, padding=pad, groups=channels) - mu2_sq
+    sigma12 = F.conv2d(pred_4d * target_4d, kernel, padding=pad, groups=channels) - mu12
 
     ssim_map = ((2.0 * mu12 + C1) * (2.0 * sigma12 + C2)) / \
                ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
-    return 1.0 - ssim_map.mean()
+    loss_map = 1.0 - ssim_map  # (1, C, H, W)
+    if mask is not None:
+        m = mask.permute(2, 0, 1).unsqueeze(0)  # (1, 1, H, W)
+        return (loss_map * m).sum() / m.sum().clamp(min=1.0) / channels
+    return loss_map.mean()
+
+
+def _depth_smooth_loss(depth, image):
+    """Edge-aware depth smoothness. depth: (H,W,1), image: (H,W,3) in [0,1].
+
+    Penalises depth changes in smooth image regions; allows discontinuities where
+    there are strong image edges. Pass depth / scene_extent for scale invariance.
+    """
+    import torch
+    depth_dx = (depth[1:, :, :] - depth[:-1, :, :]).abs()
+    depth_dy = (depth[:, 1:, :] - depth[:, :-1, :]).abs()
+    img_dx = (image[1:, :, :] - image[:-1, :, :]).abs().mean(dim=-1, keepdim=True)
+    img_dy = (image[:, 1:, :] - image[:, :-1, :]).abs().mean(dim=-1, keepdim=True)
+    return (
+        (torch.exp(-img_dx * 10.0) * depth_dx).mean()
+        + (torch.exp(-img_dy * 10.0) * depth_dy).mean()
+    )
+
+
+def _means_lr_at_step(step, total_steps, lr_init, final_factor):
+    """Exponential decay: lr_init at step 1, lr_init*final_factor at total_steps."""
+    if total_steps <= 1 or final_factor >= 1.0:
+        return lr_init
+    t = (step - 1) / (total_steps - 1)
+    return lr_init * (final_factor ** t)
 
 
 def _tick(job_state: JobState, path: Path, *, step: int, splats: int, loss: float) -> None:
