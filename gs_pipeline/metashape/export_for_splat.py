@@ -64,6 +64,11 @@ def validate_chunk(chunk: Any) -> ChunkValidation:
     dense = getattr(chunk, "dense_cloud", None)
     if dense is None:
         dense = getattr(chunk, "dense_point_cloud", None)
+    if dense is None and getattr(chunk, "tie_points", None) is not None:
+        # Metashape 2.x: dense_cloud was renamed to point_cloud;
+        # tie_points existing confirms we're on 2.x (in 1.x point_cloud
+        # was the sparse cloud).
+        dense = getattr(chunk, "point_cloud", None)
     chunk_t = getattr(chunk, "transform", None)
     chunk_identity = _is_identity_chunk_transform(chunk_t)
 
@@ -245,7 +250,9 @@ def _call_export_points(chunk: Any, out_path: Path, *, metashape_module: Any) ->
     if metashape_module is not None:
         # Newer Metashape uses .DataSource.DenseCloudData; older uses
         # .DenseCloudData top-level.
-        for path in ("DataSource.DenseCloudData", "DenseCloudData"):
+        # Metashape 2.x: DataSource.PointCloudData (was DenseCloudData)
+        for path in ("DataSource.PointCloudData", "DataSource.DenseCloudData",
+                      "PointCloudData", "DenseCloudData"):
             obj = metashape_module
             for attr in path.split("."):
                 obj = getattr(obj, attr, None)

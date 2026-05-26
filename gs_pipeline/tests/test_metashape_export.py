@@ -59,6 +59,17 @@ def test_validate_chunk_missing_dense_errors():
     assert any("dense cloud" in e for e in v.errors)
 
 
+def test_validate_chunk_metashape_2x_point_cloud():
+    """Metashape 2.x renamed dense_cloud to point_cloud and sparse to tie_points."""
+    chunk = build_stub_chunk(n_cameras=8, no_dense=True)
+    chunk.dense_cloud = None
+    chunk.point_cloud = object()
+    chunk.tie_points = object()
+    v = validate_chunk(chunk)
+    assert v.ok
+    assert v.has_dense_cloud
+
+
 def test_validate_chunk_no_cameras_errors():
     chunk = build_stub_chunk(n_cameras=0)
     v = validate_chunk(chunk)
