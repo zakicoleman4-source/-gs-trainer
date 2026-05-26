@@ -232,8 +232,7 @@ def _call_export_cameras(chunk: Any, out_path: Path, *, metashape_module: Any) -
         raise AttributeError("chunk has no exportCameras method")
     try:
         fn(str(out_path))
-    except TypeError:
-        # Some versions require a format kwarg.
+    except Exception:
         if metashape_module is not None and hasattr(metashape_module, "CamerasFormat"):
             fn(str(out_path),
                format=metashape_module.CamerasFormat.CamerasFormatXML)
@@ -267,7 +266,7 @@ def _call_export_points(chunk: Any, out_path: Path, *, metashape_module: Any) ->
         try:
             fn(str(out_path), **kwargs)
             return
-        except TypeError:
+        except Exception:
             continue
     fn(str(out_path))
 
