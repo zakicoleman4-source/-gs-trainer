@@ -60,7 +60,9 @@ def validate_chunk(chunk: Any) -> ChunkValidation:
     """
     label = getattr(chunk, "label", "") or "(unlabeled)"
     cameras = list(getattr(chunk, "cameras", []) or [])
-    n_aligned = sum(1 for c in cameras if getattr(c, "transform", None) is not None)
+    n_aligned = sum(1 for c in cameras
+                    if getattr(c, "transform", None) is not None
+                    and getattr(c, "enabled", True))
     dense = getattr(chunk, "dense_cloud", None)
     if dense is None:
         dense = getattr(chunk, "dense_point_cloud", None)
@@ -313,6 +315,8 @@ def _export_undistorted_photos(
     for camera in getattr(chunk, "cameras", []) or []:
         if getattr(camera, "transform", None) is None:
             continue
+        if not getattr(camera, "enabled", True):
+            continue
         path = _camera_photo_path(camera)
         if not path or not Path(path).is_file():
             continue
@@ -341,6 +345,8 @@ def _export_masks(
     exported = 0
     for camera in getattr(chunk, "cameras", []) or []:
         if getattr(camera, "transform", None) is None:
+            continue
+        if not getattr(camera, "enabled", True):
             continue
         mask_obj = getattr(camera, "mask", None)
         if mask_obj is None:
@@ -385,7 +391,9 @@ def _camera_photo_path(camera: Any) -> Optional[str]:
 def _build_manifest(chunk: Any, bundle_dir: Path, *, undistorted: bool = True) -> dict:
     """Summarise the bundle for the trainer's preflight (and the UI)."""
     all_cams = getattr(chunk, "cameras", []) or []
-    cameras = [c for c in all_cams if getattr(c, "transform", None) is not None]
+    cameras = [c for c in all_cams
+               if getattr(c, "transform", None) is not None
+               and getattr(c, "enabled", True)]
     masks_dir = bundle_dir / "masks"
     n_masks = len(list(masks_dir.glob("*.png"))) if masks_dir.is_dir() else 0
     return {
