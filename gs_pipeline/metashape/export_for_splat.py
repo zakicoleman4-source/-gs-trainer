@@ -258,6 +258,7 @@ def _call_export_points(chunk: Any, out_path: Path, *, metashape_module: Any) ->
             if obj is not None:
                 source = obj
                 break
+<<<<<<< Updated upstream
     try:
         if source is not None:
             fn(str(out_path), source_data=source, save_colors=True, save_normals=False)
@@ -265,6 +266,20 @@ def _call_export_points(chunk: Any, out_path: Path, *, metashape_module: Any) ->
             fn(str(out_path))
     except TypeError:
         fn(str(out_path))
+=======
+    kwargs_attempts = []
+    if source is not None:
+        kwargs_attempts.append(dict(source_data=source, save_colors=True, save_normals=False))
+        kwargs_attempts.append(dict(source_data=source))
+    kwargs_attempts.append({})
+    for kwargs in kwargs_attempts:
+        try:
+            fn(str(out_path), **kwargs)
+            return
+        except TypeError:
+            continue
+    fn(str(out_path))
+>>>>>>> Stashed changes
 
 
 def _export_undistorted_photos(
