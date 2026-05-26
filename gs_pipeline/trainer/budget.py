@@ -57,10 +57,10 @@ DEFAULT_MAX_IMAGE_SIDE = 2000
 # VRAM thresholds (bytes) → recommended max image side.
 # 24 GB (A5000/RTX 4090) bumped to 2800 for Sony Alpha 50 MP quality.
 _VRAM_IMAGE_SIDE_TABLE: list[tuple[int, int]] = [
-    (48_000_000_000, 3200),   # A6000 / A100 / H100 class
-    (24_000_000_000, 2800),   # RTX 4090 / A5000 — 2800px fits comfortably in 24 GB
-    (16_000_000_000, 2200),   # RTX 4060 Ti 16 GB class
-    (12_000_000_000, 1800),   # RTX 3060 12 GB class
+    (48_000_000_000, 4096),   # A6000 / H100 — near-full-res Sony Alpha
+    (24_000_000_000, 3200),   # A5000 / RTX 4090 — aggressive; OOM retry drops to 2400
+    (16_000_000_000, 2600),   # RTX 4060 Ti 16 GB class
+    (12_000_000_000, 2000),   # RTX 3060 12 GB class
     (0,              1600),   # 8-10 GB consumer cards
 ]
 

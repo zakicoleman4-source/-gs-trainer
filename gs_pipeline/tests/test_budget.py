@@ -189,11 +189,11 @@ def test_typical_scene_on_24gb_returns_sane_numbers():
         quality_preset="Auto",
     )
     assert b.n_cameras == 80
-    # 24 GB card auto-selects max_image_side=2800; images at 4000 get downscaled.
-    assert b.image_max_side == 2800
-    assert b.downscale_factor == pytest.approx(2800 / 4000, rel=0.01)
+    # 24 GB card auto-selects max_image_side=3200; images at 4000 get downscaled.
+    assert b.image_max_side == 3200
+    assert b.downscale_factor == pytest.approx(3200 / 4000, rel=0.01)
     assert len(b.downscale_per_camera) == 80
-    assert all(abs(f - 2800 / 4000) < 0.01 for f in b.downscale_per_camera)
+    assert all(abs(f - 3200 / 4000) < 0.01 for f in b.downscale_per_camera)
     # 12 * 1.5M dense = 18M; clipped at 0.87 * hard_cap_24gb
     assert b.target_splats == int(b.hard_cap_splats * DEFAULT_TARGET_CAP_RATIO)
     assert any("exceeds VRAM budget" in n for n in b.notes)
@@ -293,13 +293,13 @@ def test_mixed_camera_sizes_per_camera_downscale():
         quality_preset="Auto",
     )
     assert len(b.downscale_per_camera) == 15
-    # Sony cameras: scaled down from 8000 to 2800 (24 GB class → 2800 px)
+    # Sony cameras: scaled down from 8000 to 3200 (24 GB class → 3200 px)
     assert all(
-        f == pytest.approx(2800 / 8000, rel=0.01) for f in b.downscale_per_camera[:5]
+        f == pytest.approx(3200 / 8000, rel=0.01) for f in b.downscale_per_camera[:5]
     )
-    # GoPro cameras: scaled down from 3840 to 2800 (less severe than Sony)
+    # GoPro cameras: scaled down from 3840 to 3200 (less severe than Sony)
     assert all(
-        f == pytest.approx(2800 / 3840, rel=0.01) for f in b.downscale_per_camera[5:]
+        f == pytest.approx(3200 / 3840, rel=0.01) for f in b.downscale_per_camera[5:]
     )
-    # Global downscale_factor is the smallest (Sony's, since 8000 >> 2800)
-    assert b.downscale_factor == pytest.approx(2800 / 8000, rel=0.01)
+    # Global downscale_factor is the smallest (Sony's, since 8000 >> 3200)
+    assert b.downscale_factor == pytest.approx(3200 / 8000, rel=0.01)

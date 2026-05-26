@@ -31,8 +31,25 @@ from plyfile import PlyData
 
 _log = logging.getLogger(__name__)
 
-# Hard ceiling on points handed to the trainer (matches plan).
+# Default ceiling on points handed to the trainer. Overridden by
+# vram_adaptive_max_points() when GPU info is available.
 DEFAULT_TARGET_MAX_POINTS = 1_000_000
+
+# VRAM → max init points. Bigger GPU = keep more of the dense cloud.
+_VRAM_INIT_POINTS_TABLE: list[tuple[int, int]] = [
+    (48_000_000_000, 5_000_000),   # A6000 / H100: 5M init pts
+    (24_000_000_000, 3_000_000),   # A5000 / RTX 4090: 3M init pts
+    (16_000_000_000, 2_000_000),   # 16 GB class: 2M
+    (12_000_000_000, 1_500_000),   # 12 GB class: 1.5M
+    (0,              1_000_000),   # 8-10 GB: 1M (original default)
+]
+
+
+def vram_adaptive_max_points(total_vram_bytes: int) -> int:
+    for vram_thresh, max_pts in _VRAM_INIT_POINTS_TABLE:
+        if total_vram_bytes >= vram_thresh:
+            return max_pts
+    return DEFAULT_TARGET_MAX_POINTS
 # scene_extent / VOXEL_SIZE_FACTOR is the initial voxel edge length.
 DEFAULT_VOXEL_SIZE_FACTOR = 1024.0
 # Bound on adaptive voxel-size doubling.

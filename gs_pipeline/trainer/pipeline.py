@@ -197,39 +197,88 @@ def run_job(
                 _cfg = _dc_replace(_cfg, appearance_enabled=True)
                 _log.info("appearance conditioning auto-enabled (exposure variation detected)")
 
-        # Large-scene routing: when no custom train_fn is injected and the scene has
-        # >= 500 cameras, partition into spatial blocks and train each independently.
+        # OOM retry ladder: try training, on CUDA OOM reduce resolution and retry.
+        # Up to 3 attempts: full → 75% → 56% resolution. Never crash.
+        from gs_pipeline.trainer.oom_guard import is_cuda_oom, clear_cuda_cache
         from gs_pipeline.trainer.scene_partition import should_partition
-        if train_fn is None and should_partition(len(scene)):
-            from gs_pipeline.trainer.large_scene import run_large_scene
-            _log.info(
-                "Large scene detected (%d cameras >= 500); using block-partitioned training.",
-                len(scene),
-            )
-            outputs = run_large_scene(
-                scene=scene,
-                init_cloud=init_cloud,
-                budget=budget,
-                config=_cfg,
-                job_state=js,
-                job_state_path=state_path,
-                work_dir=work_dir,
-                outbox_dir=outbox_dir,
-            )
-        else:
-            if train_fn is not None:
-                trainer = train_fn
-            elif _backend == "scaffold":
-                from gs_pipeline.trainer.train_scaffold import train as _scaffold_train
-                trainer = _scaffold_train
-            else:
-                trainer = _default_train_fn
-            outputs = trainer(
-                scene=scene, init_cloud=init_cloud, budget=budget,
-                config=_cfg,
-                job_state=js, job_state_path=state_path,
-                work_dir=work_dir, outbox_dir=outbox_dir,
-            )
+
+        _max_oom_retries = 3
+        for _oom_attempt in range(_max_oom_retries):
+            try:
+                if train_fn is None and should_partition(len(scene)):
+                    from gs_pipeline.trainer.large_scene import run_large_scene
+                    _log.info(
+                        "Large scene detected (%d cameras >= 500); using block-partitioned training.",
+                        len(scene),
+                    )
+                    outputs = run_large_scene(
+                        scene=scene, init_cloud=init_cloud, budget=budget,
+                        config=_cfg, job_state=js, job_state_path=state_path,
+                        work_dir=work_dir, outbox_dir=outbox_dir,
+                    )
+                else:
+                    if train_fn is not None:
+                        trainer = train_fn
+                    elif _backend == "scaffold":
+                        from gs_pipeline.trainer.train_scaffold import train as _scaffold_train
+                        trainer = _scaffold_train
+                    else:
+                        trainer = _default_train_fn
+                    outputs = trainer(
+                        scene=scene, init_cloud=init_cloud, budget=budget,
+                        config=_cfg, job_state=js, job_state_path=state_path,
+                        work_dir=work_dir, outbox_dir=outbox_dir,
+                    )
+                break  # success
+            except Exception as _train_exc:
+                if not is_cuda_oom(_train_exc) or _oom_attempt >= _max_oom_retries - 1:
+                    raise  # not OOM or last attempt — propagate
+                clear_cuda_cache()
+                # Reduce resolution by 75% and halve target splats
+                import numpy as np
+                from dataclasses import replace as _replace
+                new_max_side = int(budget.image_max_side * 0.75)
+                new_target = max(500_000, int(budget.target_splats * 0.6))
+                _log.warning(
+                    "OOM on attempt %d — retrying with image_max_side=%d (was %d), "
+                    "target_splats=%d (was %d)",
+                    _oom_attempt + 1, new_max_side, budget.image_max_side,
+                    new_target, budget.target_splats,
+                )
+                budget = _replace(budget,
+                    image_max_side=new_max_side,
+                    target_splats=new_target,
+                    hard_cap_splats=min(budget.hard_cap_splats, int(new_target * 1.15)),
+                )
+                # Recompute per-camera downscale + rebuild K matrices and image cache
+                new_ds = []
+                scene_orig = parse_cameras_xml(
+                    work_dir / "bundle" / "cameras.xml",
+                    image_dir=work_dir / "bundle" / "images",
+                    masks_dir=(work_dir / "bundle" / "masks") if (work_dir / "bundle" / "masks").is_dir() else None,
+                )
+                for i, (w, h) in enumerate(scene_orig.image_sizes):
+                    longest = max(w, h)
+                    ds = min(1.0, new_max_side / longest)
+                    new_ds.append(ds)
+                budget = _replace(budget,
+                    downscale_per_camera=new_ds,
+                    downscale_factor=max(new_ds) if new_ds else 1.0,
+                )
+                # Re-apply K scaling and image cache on fresh scene
+                scene = scene_orig
+                for i, ds in enumerate(new_ds):
+                    if ds < 1.0:
+                        scene.K_per_camera[i, :2, :] *= ds
+                from gs_pipeline.trainer.img_cache import build_image_cache
+                scene.image_paths = build_image_cache(
+                    image_paths=scene.image_paths,
+                    downscale_per_camera=new_ds,
+                    work_dir=work_dir,
+                )
+                budget.notes.append(
+                    f"OOM retry {_oom_attempt + 1}: reduced to {new_max_side}px, {new_target:,} splats"
+                )
         js.finish(outputs)
         write_state(js, state_path)
         _log.info("job %s done; outputs=%s", job_id, asdict(outputs))
@@ -320,13 +369,14 @@ def _preflight(
                 ]
         except Exception:
             pass
-    init_cloud = load_and_downsample(dense_ply)
     gpu_info = gpu or detect_gpu()
     if gpu_info is None:
-        # Fall back to a synthetic 24 GB GPU so preflight numbers are sensible
-        # for previewing in tests / dry-runs. Real training will fail later if
-        # there is no actual GPU.
         gpu_info = GPUInfo(name="(synthetic) 24GB", total_vram_bytes=24_000_000_000)
+    from gs_pipeline.trainer.init_from_pcd import vram_adaptive_max_points
+    _max_pts = vram_adaptive_max_points(gpu_info.total_vram_bytes)
+    _log.info("VRAM-adaptive init: keeping up to %d points (GPU: %s, %d GB)",
+              _max_pts, gpu_info.name, gpu_info.total_vram_bytes // 1_000_000_000)
+    init_cloud = load_and_downsample(dense_ply, target_max_points=_max_pts)
     budget = compute_budget(
         gpu=gpu_info,
         image_sizes=scene.image_sizes,
