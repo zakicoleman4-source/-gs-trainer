@@ -123,26 +123,40 @@ def evaluate_holdout(
     far_plane: float,
     downscale: float = 1.0,
     downscale_per_camera: Optional[list[float]] = None,
-) -> tuple[float, float]:
-    """Mean PSNR / SSIM over the holdout cameras. Returns (psnr, ssim)."""
+    per_camera: bool = False,
+):
+    """Mean PSNR / SSIM over the holdout cameras.
+
+    Returns ``(mean_psnr, mean_ssim)`` by default.  When ``per_camera=True``
+    returns ``(mean_psnr, mean_ssim, list[dict])`` where each dict has keys
+    ``cam_i``, ``psnr``, ``ssim``.
+    """
     import torch
     psnrs: list[float] = []
     ssims: list[float] = []
+    per_cam: list[dict] = []
     with torch.no_grad():
-        for list_pos, cam_i in enumerate(holdout_idx):
+        for cam_i in holdout_idx:
             ds = downscale_per_camera[cam_i] if downscale_per_camera is not None else downscale
             K, w2c, image_path = _load_camera(scene, cam_i, downscale=ds)
             target_np = _load_image_np(image_path, ds)
-            target = torch.from_numpy(target_np).to(inputs.means.device)
             pred, _ = render_view(
                 inputs, K=K.to(inputs.means.device), w2c=w2c.to(inputs.means.device),
-                width=target.shape[1], height=target.shape[0],
+                width=target_np.shape[1], height=target_np.shape[0],
                 near_plane=near_plane, far_plane=far_plane,
             )
             pred_np = pred.detach().cpu().numpy()
-            psnrs.append(psnr(pred_np, target_np))
-            ssims.append(ssim(pred_np, target_np))
-    return float(np.mean(psnrs)) if psnrs else float("nan"), float(np.mean(ssims)) if ssims else float("nan")
+            p = psnr(pred_np, target_np)
+            s = ssim(pred_np, target_np)
+            psnrs.append(p)
+            ssims.append(s)
+            if per_camera:
+                per_cam.append({"cam_i": int(cam_i), "psnr": round(p, 4), "ssim": round(s, 4)})
+    mean_p = float(np.mean(psnrs)) if psnrs else float("nan")
+    mean_s = float(np.mean(ssims)) if ssims else float("nan")
+    if per_camera:
+        return mean_p, mean_s, per_cam
+    return mean_p, mean_s
 
 
 def save_preview_png(
@@ -228,15 +242,30 @@ def save_preview_strip(
                 near_plane=near_plane,
                 far_plane=far_plane,
             )
-            arr = (pred.detach().cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+            pred_np = pred.detach().cpu().numpy()
+            panel_psnr = psnr(pred_np, target_np)
+            arr = (pred_np * 255.0).clip(0, 255).astype(np.uint8)
             # Resize to target_height_px maintaining aspect ratio
             h, w = arr.shape[:2]
             new_w = max(1, int(round(w * target_height_px / h)))
-            resized = np.asarray(
-                Image.fromarray(arr).resize((new_w, target_height_px), Image.LANCZOS),
-                dtype=np.uint8,
-            )
-            panels.append(resized)
+            img_panel = Image.fromarray(arr).resize((new_w, target_height_px), Image.LANCZOS)
+
+            # Overlay PSNR label
+            try:
+                from PIL import ImageDraw, ImageFont
+                draw = ImageDraw.Draw(img_panel)
+                try:
+                    font = ImageFont.load_default(size=18)
+                except TypeError:
+                    font = ImageFont.load_default()
+                label = f"PSNR {panel_psnr:.1f} dB" if not math.isinf(panel_psnr) else "PSNR ∞"
+                # Black shadow then white text for contrast on any background.
+                draw.text((11, 9), label, fill=(0, 0, 0), font=font)
+                draw.text((10, 8), label, fill=(255, 255, 255), font=font)
+            except Exception:
+                pass
+
+            panels.append(np.asarray(img_panel, dtype=np.uint8))
 
     # Build strip: panels separated by white vertical bars
     strip_parts: list[np.ndarray] = []

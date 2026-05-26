@@ -732,7 +732,7 @@ def train(
                 "n_output": f_report.n_output,
                 "summary": f_report.summary,
             }
-            _final_np = (f_means, f_scales, f_quats, f_opacities, f_sh_dc)
+            _final_np = (f_means, f_scales, f_quats, f_opacities, f_sh_dc, f_sh_rest)
         else:
             _final_np = (
                 means.detach().cpu().numpy(),
@@ -740,7 +740,31 @@ def train(
                 quats.detach().cpu().numpy(),
                 opacities.detach().cpu().numpy(),
                 sh_dc.detach().cpu().numpy(),
+                sh_rest.detach().cpu().numpy(),
             )
+
+        # Final per-camera evaluation with the filtered splats.
+        _per_cam_stats: list[dict] = []
+        try:
+            _final_ri = RenderInputs(
+                means=torch.from_numpy(_final_np[0]).float().to(device),
+                scales=torch.from_numpy(_final_np[1]).float().to(device),
+                quats=torch.from_numpy(_final_np[2]).float().to(device),
+                opacities=torch.from_numpy(_final_np[3]).float().to(device),
+                sh_dc=torch.from_numpy(_final_np[4]).float().to(device),
+                sh_rest=torch.from_numpy(_final_np[5]).float().to(device),
+                sh_degree=config.sh_degree, full_sh_degree=config.sh_degree,
+            )
+            _final_psnr, _final_ssim, _per_cam_stats = evaluate_holdout(
+                _final_ri, scene=scene, holdout_idx=holdout_idx,
+                near_plane=near, far_plane=far, downscale=1.0,
+                per_camera=True,
+            )
+            _log.info("Final holdout PSNR %.2f dB  SSIM %.4f", _final_psnr, _final_ssim)
+        except Exception as _eval_exc:
+            _log.warning("Final evaluation failed: %s", _eval_exc)
+            _final_psnr = job_state.progress.psnr_history[-1][1] if job_state.progress.psnr_history else None
+            _final_ssim = job_state.progress.ssim_history[-1][1] if job_state.progress.ssim_history else None
 
         # Compact .splat binary — 32 bytes/splat, web-compatible with SuperSplat.
         if config.export_splat_binary:
@@ -751,16 +775,15 @@ def train(
                 opacities=_final_np[3], sh_dc=_final_np[4],
             )
 
-        _final_psnr = job_state.progress.psnr_history[-1][1] if job_state.progress.psnr_history else None
-        _final_ssim = job_state.progress.ssim_history[-1][1] if job_state.progress.ssim_history else None
         _final_count = int(_final_np[0].shape[0])
 
         report = {
             "job_id": job_state.job_id,
             "final_step": config.iterations,
             "final_splat_count": _final_count,
-            "final_psnr_db": _final_psnr,
-            "final_ssim": _final_ssim,
+            "final_psnr_db": round(_final_psnr, 4) if _final_psnr is not None else None,
+            "final_ssim": round(_final_ssim, 4) if _final_ssim is not None else None,
+            "holdout_per_camera": _per_cam_stats,
             "preflight": job_state.preflight.__dict__ if job_state.preflight else None,
             "filter": filter_report_dict if filter_report_dict else None,
         }
