@@ -197,13 +197,13 @@ def export_chunk_to_bundle_dir(
     _call_export_points(chunk, dense_ply, metashape_module=metashape_module)
 
     progress("exporting undistorted photos", 0.60)
-    _export_undistorted_photos(chunk, bundle_dir / "images", metashape_module=metashape_module)
+    _did_undistort = _export_undistorted_photos(chunk, bundle_dir / "images", metashape_module=metashape_module)
 
     progress("exporting masks", 0.80)
     _export_masks(chunk, bundle_dir / "masks", metashape_module=metashape_module)
 
     progress("writing manifest", 0.95)
-    manifest = _build_manifest(chunk, bundle_dir)
+    manifest = _build_manifest(chunk, bundle_dir, undistorted=_did_undistort)
     (bundle_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=2), encoding="utf-8"
     )
@@ -278,8 +278,12 @@ def _export_undistorted_photos(
     images_dir: Path,
     *,
     metashape_module: Any = None,
-) -> None:
+) -> bool:
     """Copy or undistort each aligned camera's photo into ``images_dir``.
+
+    Returns True if ``chunk.undistortPhotos()`` ran successfully (photos are
+    genuinely undistorted). Returns False when falling back to copying the
+    original photos (which may still carry lens distortion).
 
     Metashape 2.0+ has ``chunk.undistortPhotos(path, ...)``. Older versions
     require per-camera ``camera.image()`` calls. We try the modern API first.
@@ -290,9 +294,9 @@ def _export_undistorted_photos(
     if callable(fn):
         try:
             fn(str(images_dir))
-            return
+            return True   # undistortPhotos succeeded — photos are clean
         except Exception:
-            # Fall through to the per-camera path on any failure.
+            # Fall through to the per-camera copy path on any failure.
             pass
     for camera in getattr(chunk, "cameras", []) or []:
         if getattr(camera, "transform", None) is None:
@@ -305,6 +309,7 @@ def _export_undistorted_photos(
             shutil.copy2(path, dest)
         except OSError:
             continue
+    return False   # raw copies only — distortion not removed
 
 
 def _export_masks(
@@ -365,7 +370,7 @@ def _camera_photo_path(camera: Any) -> Optional[str]:
     return None
 
 
-def _build_manifest(chunk: Any, bundle_dir: Path) -> dict:
+def _build_manifest(chunk: Any, bundle_dir: Path, *, undistorted: bool = True) -> dict:
     """Summarise the bundle for the trainer's preflight (and the UI)."""
     all_cams = getattr(chunk, "cameras", []) or []
     cameras = [c for c in all_cams if getattr(c, "transform", None) is not None]
@@ -377,7 +382,7 @@ def _build_manifest(chunk: Any, bundle_dir: Path) -> dict:
         "chunk_label": getattr(chunk, "label", None),
         "n_cameras": len(cameras),
         "image_size": _peek_image_size(chunk),
-        "undistorted": True,
+        "undistorted": undistorted,
         "has_masks": n_masks > 0,
         "n_masks": n_masks,
         "files": [p.name for p in sorted(bundle_dir.iterdir()) if p.is_file()],

@@ -214,3 +214,79 @@ def _stub_module():
     """Return a tiny module-like object with the constants the exporter looks up."""
     import gs_pipeline.tests.stubs.metashape_stub as m
     return m
+
+
+# ---------------------------------------------------------------------------
+# Undistorted flag in manifest
+# ---------------------------------------------------------------------------
+
+def test_manifest_undistorted_true_when_undistortphotos_succeeds(tmp_path: Path):
+    """Normal export via stub (undistortPhotos works) → manifest.undistorted = True."""
+    import json
+    chunk = build_stub_chunk(n_cameras=4, image_size=64)
+    export_chunk_to_bundle_dir(chunk, tmp_path / "bundle", metashape_module=_stub_module())
+    m = json.loads((tmp_path / "bundle" / "manifest.json").read_text())
+    assert m["undistorted"] is True
+
+
+def test_manifest_undistorted_false_when_undistortphotos_raises(tmp_path: Path):
+    """If undistortPhotos raises, fallback copies raw photos → undistorted = False."""
+    import json
+    from gs_pipeline.metashape.export_for_splat import export_chunk_to_bundle_dir
+
+    chunk = build_stub_chunk(n_cameras=4, image_size=64)
+
+    # Monkey-patch undistortPhotos to fail so the fallback path is exercised.
+    original = chunk.undistortPhotos
+    chunk.undistortPhotos = lambda path: (_ for _ in ()).throw(RuntimeError("simulated failure"))
+
+    export_chunk_to_bundle_dir(chunk, tmp_path / "bundle", metashape_module=_stub_module())
+    m = json.loads((tmp_path / "bundle" / "manifest.json").read_text())
+    assert m["undistorted"] is False
+
+
+# ---------------------------------------------------------------------------
+# Watcher quality sidecar
+# ---------------------------------------------------------------------------
+
+def test_read_opts_quality_returns_default_when_no_file(tmp_path: Path):
+    from gs_pipeline.trainer.watcher import _read_opts_quality
+    fake_zip = tmp_path / "claim__abc123__scene.zip"
+    assert _read_opts_quality(fake_zip, default="Auto") == "Auto"
+
+
+def test_read_opts_quality_reads_sidecar(tmp_path: Path):
+    import json
+    from gs_pipeline.trainer.watcher import _read_opts_quality
+    fake_zip = tmp_path / "claim__abc123__scene.zip"
+    fake_zip.with_suffix(".opts.json").write_text(json.dumps({"quality": "Maximum"}))
+    assert _read_opts_quality(fake_zip, default="Auto") == "Maximum"
+
+
+def test_read_opts_quality_ignores_invalid_value(tmp_path: Path):
+    import json
+    from gs_pipeline.trainer.watcher import _read_opts_quality
+    fake_zip = tmp_path / "claim__abc123__scene.zip"
+    fake_zip.with_suffix(".opts.json").write_text(json.dumps({"quality": "UltraHD"}))
+    assert _read_opts_quality(fake_zip, default="Auto") == "Auto"  # unknown → fall back to default
+
+
+def test_claim_next_also_renames_opts_sidecar(tmp_path: Path):
+    """When _claim_next renames a zip, the companion .opts.json renames too."""
+    import json
+    from gs_pipeline.trainer.watcher import _claim_next, CLAIM_PREFIX
+    # Create a fake inbox zip + opts sidecar
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    zip_file = inbox / "scene.zip"
+    zip_file.write_bytes(b"PK")   # minimal content
+    opts_file = zip_file.with_suffix(".opts.json")
+    opts_file.write_text(json.dumps({"quality": "Maximum"}))
+
+    claimed = _claim_next(inbox)
+    assert claimed is not None
+    assert claimed.name.startswith(CLAIM_PREFIX)
+    assert not opts_file.exists()
+    opts_claimed = claimed.with_suffix(".opts.json")
+    assert opts_claimed.is_file()
+    assert json.loads(opts_claimed.read_text())["quality"] == "Maximum"

@@ -121,6 +121,11 @@ def process_one_subprocess(
     log_dir = job_log_dir(paths.logs, job_id)
     log_dir.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
+
+    # Per-job quality preset: read from opts sidecar written by the UI,
+    # fall back to the watcher-level default (from supervisord / CLI arg).
+    job_quality = _read_opts_quality(zip_path, default=quality_preset)
+
     cmd = [
         python, "-m", "gs_pipeline.trainer.pipeline",
         "--job-id", job_id,
@@ -128,7 +133,7 @@ def process_one_subprocess(
         "--work-root", str(paths.work),
         "--outbox-root", str(paths.outbox),
         "--log-root", str(paths.logs),
-        "--quality-preset", quality_preset,
+        "--quality-preset", job_quality,
     ]
     if paths.config_yaml is not None:
         cmd += ["--config-yaml", str(paths.config_yaml)]
@@ -174,7 +179,8 @@ def _claim_next(inbox: Path) -> Optional[Path]:
     """Atomically rename the oldest unclaimed .zip to a claim__<job>__name path.
 
     Returns the renamed path (now safe to operate on), or None if no
-    unclaimed zip exists.
+    unclaimed zip exists. Also renames a companion ``.opts.json`` sidecar
+    (written by the UI with per-job quality settings) so it stays alongside.
     """
     inbox = Path(inbox)
     def _safe_mtime(p: Path) -> float:
@@ -193,8 +199,31 @@ def _claim_next(inbox: Path) -> Optional[Path]:
             candidate.rename(claimed_path)
         except FileNotFoundError:
             continue  # someone else grabbed it (shouldn't happen with one worker, but safe)
+        # Rename companion opts sidecar so it tracks the claim.
+        opts_src = candidate.with_suffix(".opts.json")
+        if opts_src.exists():
+            try:
+                opts_src.rename(claimed_path.with_suffix(".opts.json"))
+            except OSError:
+                pass
         return claimed_path
     return None
+
+
+def _read_opts_quality(claim_path: Path, *, default: str = "Auto") -> str:
+    """Read the quality preset from a per-job ``.opts.json`` sidecar if present."""
+    opts_path = claim_path.with_suffix(".opts.json")
+    if not opts_path.is_file():
+        return default
+    try:
+        import json as _json
+        opts = _json.loads(opts_path.read_text(encoding="utf-8"))
+        q = opts.get("quality", default)
+        if q in ("Auto", "Maximum"):
+            return q
+    except Exception:
+        pass
+    return default
 
 
 def _job_id_from_claim(claim_path: Path) -> str:

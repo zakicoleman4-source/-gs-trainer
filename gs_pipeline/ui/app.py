@@ -144,7 +144,11 @@ def _start_training(report: PreflightReport, quality: str) -> None:
     sees the new file, claims it (rename to ``claim__<id>__name.zip``), and
     invokes ``pipeline.run_job`` as a subprocess. The UI then transitions to
     the training phase and starts polling state.json.
+
+    Per-job quality is communicated via a sidecar ``.opts.json`` file written
+    alongside the zip. The watcher reads it before spawning the trainer subprocess.
     """
+    import json as _json
     zip_path = Path(st.session_state["uploaded_bundle_path"])
     DEFAULT_INBOX.mkdir(parents=True, exist_ok=True)
     target = DEFAULT_INBOX / zip_path.name
@@ -155,6 +159,9 @@ def _start_training(report: PreflightReport, quality: str) -> None:
             i += 1
         target = DEFAULT_INBOX / f"{zip_path.stem}_{i}.zip"
     shutil.move(str(zip_path), str(target))
+    # Write per-job opts so the watcher can honour the UI's quality choice.
+    opts = {"quality": quality}
+    target.with_suffix(".opts.json").write_text(_json.dumps(opts), encoding="utf-8")
     # The watcher will rename to claim__<id>__name.zip; we discover the id
     # by polling inbox/ for that prefix on the live dashboard.
     st.session_state["expected_bundle_name"] = target.name
