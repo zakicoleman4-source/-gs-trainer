@@ -243,7 +243,13 @@ def _call_export_cameras(chunk: Any, out_path: Path, *, metashape_module: Any) -
 
 
 def _call_export_points(chunk: Any, out_path: Path, *, metashape_module: Any) -> None:
-    """Wrap Metashape's point-cloud export (1.x: exportPoints, 2.x: exportPointCloud)."""
+    """Wrap Metashape's point-cloud export in chunk-local coordinates.
+
+    Forces crs=None so georeferenced projects export in the same local frame
+    as the camera transforms in cameras.xml. Without this, a GPS-aligned
+    project would export the dense cloud in UTM/ECEF while cameras are in
+    chunk-local — a coordinate mismatch that breaks training.
+    """
     fn = getattr(chunk, "exportPointCloud", None) or getattr(chunk, "exportPoints", None)
     if fn is None:
         raise AttributeError("chunk has no exportPointCloud or exportPoints method")
@@ -259,10 +265,16 @@ def _call_export_points(chunk: Any, out_path: Path, *, metashape_module: Any) ->
             if obj is not None:
                 source = obj
                 break
+
+    # Build kwargs with crs=None to force chunk-local coordinates.
+    # Metashape 2.x accepts crs=None; 1.x may not — fall through on TypeError.
     kwargs_attempts = []
     if source is not None:
+        kwargs_attempts.append(dict(source_data=source, save_colors=True, save_normals=False, crs=None))
         kwargs_attempts.append(dict(source_data=source, save_colors=True, save_normals=False))
+        kwargs_attempts.append(dict(source_data=source, crs=None))
         kwargs_attempts.append(dict(source_data=source))
+    kwargs_attempts.append(dict(crs=None))
     kwargs_attempts.append({})
     for kwargs in kwargs_attempts:
         try:
