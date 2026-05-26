@@ -19,7 +19,7 @@ services:
       - ./work:/data/work
       - ./config:/data/config
     environment:
-      MAX_UPLOAD_GB: "8"
+      MAX_UPLOAD_GB: "20"
       QUALITY_PRESET_DEFAULT: "Auto"
       MAX_IMAGE_SIDE: "2000"
     # NVIDIA GPU passthrough. Requires `nvidia-container-toolkit` on the host
@@ -33,4 +33,5 @@ services:
               capabilities: [gpu]
     # Single-job concurrency: even if you scale to >1 container the worker
     # inside each one will only train one bundle at a time.
-    shm_size: "2gb"
+    # 8 GB shared memory: PyTorch IPC + large image batches on 500-photo bundles.
+    shm_size: "8gb"
