@@ -103,6 +103,7 @@ def run_job(
     quality_preset: str = "Auto",
     train_fn: Optional[TrainFn] = None,
     bundle_filename: Optional[str] = None,
+    trainer_backend: str = "mcmc",
 ) -> JobState:
     """Run one job end-to-end. Writes ``state.json`` updates along the way.
 
@@ -158,13 +159,31 @@ def run_job(
         js.start_training(preflight)
         write_state(js, state_path)
 
-        from gs_pipeline.trainer.train_mcmc import load_trainer_config, auto_adjust_config_for_scene
-        if config_yaml is not None:
-            _cfg = load_trainer_config(config_yaml)
-            _cfg = auto_adjust_config_for_scene(_cfg, n_cameras=len(scene))
+        # Resolve trainer backend: explicit parameter > config.yaml > default
+        _backend = trainer_backend
+        if _backend == "mcmc" and config_yaml is not None:
+            import yaml as _yaml
+            _raw = _yaml.safe_load(config_yaml.read_text(encoding="utf-8")) or {}
+            _backend = _raw.get("trainer", {}).get("backend", "mcmc")
+
+        if _backend == "scaffold":
+            from gs_pipeline.trainer.train_scaffold import (
+                ScaffoldConfig, load_scaffold_config, auto_adjust_scaffold_config_for_scene,
+            )
+            if config_yaml is not None:
+                _cfg = load_scaffold_config(config_yaml)
+            else:
+                _cfg = ScaffoldConfig()
+            _cfg = auto_adjust_scaffold_config_for_scene(_cfg, n_cameras=len(scene))
+            _log.info("Trainer backend: scaffold (%d anchors budget)", budget.target_splats // _cfg.n_offsets)
         else:
-            from gs_pipeline.trainer.train_mcmc import TrainerConfig
-            _cfg = auto_adjust_config_for_scene(TrainerConfig(), n_cameras=len(scene))
+            from gs_pipeline.trainer.train_mcmc import load_trainer_config, auto_adjust_config_for_scene
+            if config_yaml is not None:
+                _cfg = load_trainer_config(config_yaml)
+                _cfg = auto_adjust_config_for_scene(_cfg, n_cameras=len(scene))
+            else:
+                from gs_pipeline.trainer.train_mcmc import TrainerConfig
+                _cfg = auto_adjust_config_for_scene(TrainerConfig(), n_cameras=len(scene))
 
         # Large-scene routing: when no custom train_fn is injected and the scene has
         # >= 500 cameras, partition into spatial blocks and train each independently.
@@ -186,7 +205,13 @@ def run_job(
                 outbox_dir=outbox_dir,
             )
         else:
-            trainer = train_fn or _default_train_fn
+            if train_fn is not None:
+                trainer = train_fn
+            elif _backend == "scaffold":
+                from gs_pipeline.trainer.train_scaffold import train as _scaffold_train
+                trainer = _scaffold_train
+            else:
+                trainer = _default_train_fn
             outputs = trainer(
                 scene=scene, init_cloud=init_cloud, budget=budget,
                 config=_cfg,

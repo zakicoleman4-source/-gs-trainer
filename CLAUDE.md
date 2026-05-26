@@ -208,12 +208,27 @@ User can compare filter levels: no_filter, light, default, aggressive, extreme.
 - `TORCH_CUDA_ARCH_LIST` expanded to include Volta (7.0) and Turing (7.5)
 - `MAX_IMAGE_SIDE` removed from docker-compose.yml (now VRAM-adaptive via budget.py)
 
+## Scaffold-GS trainer (`train_scaffold.py`)
+Alternative to MCMC for +1 dB PSNR (~30.13 vs ~29.18 on MipNeRF360). Selected via
+`trainer.backend: scaffold` in config.yaml or the Streamlit UI dropdown.
+
+Architecture: anchor-based neural Gaussian hierarchy.
+- **Anchors** (~200K): voxel-quantized positions with learnable features (dim=32)
+- **Neural Gaussians**: 3 MLPs (opacity, covariance, color) predict per-view Gaussian
+  attributes from anchor features + view direction. Each anchor spawns `n_offsets=10` Gaussians.
+- **Densification**: grows/prunes anchors on multi-resolution voxel grid (not individual Gaussians)
+- **PLY export**: "bakes" neural Gaussians from canonical viewpoint (mean of all camera centers)
+  to standard INRIA format. Baked PLY goes through existing `filter_splats.py` chain unchanged.
+
+Uses gsplat `rasterization(sh_degree=None)` with raw RGB — no SH, no new CUDA deps.
+
+Config: `scaffold:` section in config.yaml. `ScaffoldConfig` dataclass in `train_scaffold.py`.
+
 ## Pending work
 - UI: filter comparison view (let user choose filter level and download)
-- UI preflight screen: show large-scene mode info (block count, cameras per block)
-- UI filter comparison view: show before/after splat counts + per-filter breakdown in job dashboard
 - Validate `export_for_splat.py` Metashape script on actual Metashape Pro install
-- GTX 1080 (sm_61) needs patched gsplat (labeled_partition -> coalesced_threads); Docker build on Volta+ is fine
+- GTX 1080 (sm_61) needs patched gsplat; Docker build on Volta+ is fine
+- GPU smoke test Scaffold-GS on real data
 
 ## Repo
 https://github.com/zakicoleman4-source/-gs-trainer (private)

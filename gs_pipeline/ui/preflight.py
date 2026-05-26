@@ -44,6 +44,7 @@ class PreflightReport:
     n_blocks: int = 1
     block_grid: tuple[int, int] = (1, 1)
     cameras_per_block: list[int] = None
+    trainer_backend: str = "mcmc"
 
 
 def estimate_training_minutes(target_splats: int, iterations: int) -> float:

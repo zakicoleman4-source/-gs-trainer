@@ -6,6 +6,9 @@
 # from work/<job_id>/config_override.yaml when the watcher needs to retry
 # under OOM pressure (smaller cap_max, smaller image_max_side).
 
+trainer:
+  backend: mcmc                   # "mcmc" | "scaffold"
+
 quality:
   preset: Auto                  # "Auto" | "Maximum" — overridden by UI
 
@@ -114,3 +117,30 @@ large_scene:
   target_cameras_per_block: 150   # target cameras per spatial block
   overlap_factor: 0.20            # fractional spatial overlap between adjacent blocks
   visibility_threshold: 0.25      # min AABB projection coverage to assign a camera to a block
+
+# Scaffold-GS trainer (alternative to MCMC for +1 dB PSNR).
+# Anchor-based neural Gaussian hierarchy; MLPs predict per-view attributes.
+scaffold:
+  n_offsets: 10                    # neural Gaussians generated per anchor
+  anchor_feat_dim: 32              # per-anchor feature vector dimension
+  voxel_size_factor: 1.0           # multiplier on auto-computed voxel size
+  mlp_hidden_dim: 64               # hidden width for opacity/cov/color MLPs
+  lr_anchor_pos: 0.0               # anchors stay at voxel centers
+  lr_anchor_feat: 0.0075
+  lr_anchor_offsets: 0.01
+  lr_anchor_scales: 0.007
+  lr_mlp_opacity: 0.002
+  lr_mlp_cov: 0.004
+  lr_mlp_color: 0.008
+  lr_appearance: 0.05
+  lr_final_factor: 0.01            # exponential decay target for decayed groups
+  grow_start_iter: 1500
+  grow_stop_iter: 15000
+  grow_every: 100
+  grow_grad_threshold: 0.0002
+  grow_voxel_levels: 3             # multi-resolution anchor growing (3 depth levels)
+  prune_opacity_threshold: 0.005
+  prune_min_visits: 80
+  appearance_embed_dim: 32
+  opacity_reg: 0.01
+  scale_reg: 0.01
