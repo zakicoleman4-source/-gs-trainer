@@ -135,11 +135,29 @@ def run_job(
             bundle_dir=bundle_dir, gpu=gpu, quality_preset=quality_preset,
         )
 
+        # Center scene to avoid float32 precision issues with georeferenced
+        # coordinates (UTM/ECEF positions like 500000,4000000 kill precision).
+        import numpy as np
+        centroid = init_cloud.xyz.mean(axis=0)
+        if np.linalg.norm(centroid) > 100.0:
+            _log.info(
+                "Centering scene (centroid at %.1f, %.1f, %.1f — likely georeferenced)",
+                *centroid,
+            )
+            init_cloud.xyz -= centroid
+            init_cloud.aabb_min -= centroid
+            init_cloud.aabb_max -= centroid
+            for i in range(len(scene)):
+                w2c = scene.w2c_per_camera[i]
+                R = w2c[:3, :3]
+                t = w2c[:3, 3]
+                t += R @ centroid  # shift camera translation to match centered scene
+                scene.w2c_per_camera[i, :3, 3] = t
+
         if budget.downscale_factor < 1.0:
             # Pre-scale K matrices in-place so the training loop never needs to
             # apply a per-camera factor: K[i] * ds_i once here is cheaper and
             # cleaner than scaling at every training step.
-            import numpy as np
             for i, ds in enumerate(budget.downscale_per_camera):
                 if ds < 1.0:
                     scene.K_per_camera[i, :2, :] *= ds  # scale fx,cx and fy,cy rows
