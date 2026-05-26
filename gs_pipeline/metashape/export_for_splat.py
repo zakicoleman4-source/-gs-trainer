@@ -112,23 +112,21 @@ def _is_identity_chunk_transform(t: Any) -> bool:
     """Best-effort check for an identity Metashape Matrix transform."""
     if t is None:
         return True
-    # Real Metashape Matrix exposes a .matrix or behaves like a 2D sequence.
-    try:
-        rows = [list(r) for r in t]
-    except TypeError:
-        # Single object with a `matrix` attribute.
-        mat = getattr(t, "matrix", None)
-        if mat is None:
-            return True
-        rows = [list(r) for r in mat]
-    if len(rows) < 3:
+    mat = getattr(t, "matrix", t)
+    if mat is None:
         return True
-    # Compare top-left 4x4 / 3x4 against identity.
-    for i, row in enumerate(rows[:4]):
-        for j, val in enumerate(row[:4]):
-            target = 1.0 if i == j else 0.0
-            if abs(float(val) - target) > 1.0e-6:
-                return False
+    try:
+        for i in range(4):
+            for j in range(4):
+                try:
+                    val = float(mat[i, j])
+                except (TypeError, KeyError):
+                    val = float(mat[i][j])
+                target = 1.0 if i == j else 0.0
+                if abs(val - target) > 1.0e-6:
+                    return False
+    except Exception:
+        return True
     return True
 
 
