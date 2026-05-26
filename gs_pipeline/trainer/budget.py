@@ -209,6 +209,78 @@ def compute_image_downscale(
 
 
 # ---------------------------------------------------------------------------
+# VRAM estimation — predict whether a (splats, resolution) combo fits
+# ---------------------------------------------------------------------------
+
+# Rasterizer per-pixel cost: rendered RGBA + gradients + tile metadata.
+# Empirically ~200-300 bytes/pixel; we budget 250 as a safe middle ground.
+PER_PIXEL_BYTES = 250
+
+
+def estimate_vram_bytes(
+    target_splats: int,
+    image_w: int,
+    image_h: int,
+    *,
+    per_splat_bytes: int = DEFAULT_PER_SPLAT_BYTES,
+    fixed_overhead_bytes: int = DEFAULT_FIXED_OVERHEAD_BYTES,
+    per_pixel_bytes: int = PER_PIXEL_BYTES,
+) -> int:
+    """Estimate peak GPU memory for training with the given parameters."""
+    splat_mem = target_splats * per_splat_bytes
+    image_mem = image_w * image_h * per_pixel_bytes
+    return fixed_overhead_bytes + splat_mem + image_mem
+
+
+def fits_in_vram(
+    total_vram_bytes: int,
+    target_splats: int,
+    image_w: int,
+    image_h: int,
+    *,
+    safety: float = DEFAULT_VRAM_SAFETY,
+) -> bool:
+    """Return True if the estimated VRAM usage fits within the safety budget."""
+    estimated = estimate_vram_bytes(target_splats, image_w, image_h)
+    available = int(total_vram_bytes * safety)
+    return estimated <= available
+
+
+def find_max_image_side_that_fits(
+    total_vram_bytes: int,
+    target_splats: int,
+    image_sizes: list[tuple[int, int]],
+    *,
+    safety: float = DEFAULT_VRAM_SAFETY,
+    min_side: int = 800,
+) -> int:
+    """Binary search for the largest max_image_side that fits in VRAM.
+
+    Tests the largest training image (after downscale) against the VRAM budget.
+    Returns max_image_side in pixels.
+    """
+    longest_orig = max(max(w, h) for w, h in image_sizes) if image_sizes else 1600
+    lo, hi = min_side, longest_orig
+
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        # Compute the largest training image at this max_side
+        max_w, max_h = 0, 0
+        for w, h in image_sizes:
+            longest = max(w, h)
+            ds = min(1.0, mid / longest) if longest > mid else 1.0
+            tw, th = int(w * ds), int(h * ds)
+            if tw * th > max_w * max_h:
+                max_w, max_h = tw, th
+        if fits_in_vram(total_vram_bytes, target_splats, max_w, max_h, safety=safety):
+            lo = mid
+        else:
+            hi = mid - 1
+
+    return lo
+
+
+# ---------------------------------------------------------------------------
 # Top-level: pull it all together
 # ---------------------------------------------------------------------------
 
@@ -237,8 +309,6 @@ def compute_budget(
     Raises:
         ValueError on unknown preset, empty image list, or non-positive counts.
     """
-    if max_image_side is None:
-        max_image_side = recommended_max_image_side(gpu.total_vram_bytes)
     if quality_preset not in QUALITY_ITERATIONS:
         raise ValueError(
             f"unknown quality preset {quality_preset!r}; "
@@ -248,6 +318,20 @@ def compute_budget(
         raise ValueError("image_sizes is empty; cannot compute budget")
     if dense_pts <= 0:
         raise ValueError(f"dense_pts must be positive; got {dense_pts}")
+
+    if max_image_side is None:
+        max_image_side = recommended_max_image_side(gpu.total_vram_bytes)
+        # Verify the recommended side actually fits in VRAM with estimated splats.
+        _rough_cap = compute_hard_cap_splats(gpu.total_vram_bytes, safety=safety,
+            fixed_overhead_bytes=fixed_overhead_bytes, per_splat_bytes=per_splat_bytes)
+        _rough_target = int(_rough_cap * DEFAULT_TARGET_CAP_RATIO)
+        _largest_img = max(image_sizes, key=lambda wh: wh[0] * wh[1])
+        _ds = min(1.0, max_image_side / max(_largest_img))
+        _tw, _th = int(_largest_img[0] * _ds), int(_largest_img[1] * _ds)
+        if not fits_in_vram(gpu.total_vram_bytes, _rough_target, _tw, _th, safety=safety):
+            max_image_side = find_max_image_side_that_fits(
+                gpu.total_vram_bytes, _rough_target, list(image_sizes), safety=safety,
+            )
 
     n_cameras = len(image_sizes)
     longest_side = max(max(w, h) for w, h in image_sizes)
