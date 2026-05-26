@@ -258,15 +258,6 @@ def _call_export_points(chunk: Any, out_path: Path, *, metashape_module: Any) ->
             if obj is not None:
                 source = obj
                 break
-<<<<<<< Updated upstream
-    try:
-        if source is not None:
-            fn(str(out_path), source_data=source, save_colors=True, save_normals=False)
-        else:
-            fn(str(out_path))
-    except TypeError:
-        fn(str(out_path))
-=======
     kwargs_attempts = []
     if source is not None:
         kwargs_attempts.append(dict(source_data=source, save_colors=True, save_normals=False))
@@ -279,7 +270,6 @@ def _call_export_points(chunk: Any, out_path: Path, *, metashape_module: Any) ->
         except TypeError:
             continue
     fn(str(out_path))
->>>>>>> Stashed changes
 
 
 def _export_undistorted_photos(
@@ -303,13 +293,10 @@ def _export_undistorted_photos(
         except Exception:
             # Fall through to the per-camera path on any failure.
             pass
-    # Fallback: copy original photos verbatim. Trainer's parse will warn if
-    # distortion is non-zero in the cameras.xml so the user sees the issue.
-    for camera in (chunk.cameras or []):
+    for camera in getattr(chunk, "cameras", []) or []:
         if getattr(camera, "transform", None) is None:
-            continue  # unaligned
-        photo = getattr(camera, "photo", None)
-        path = getattr(photo, "path", None) if photo is not None else None
+            continue
+        path = _camera_photo_path(camera)
         if not path or not Path(path).is_file():
             continue
         dest = images_dir / Path(path).name
@@ -319,9 +306,27 @@ def _export_undistorted_photos(
             continue
 
 
+def _camera_photo_path(camera: Any) -> Optional[str]:
+    """Extract the source image path from a camera across Metashape versions."""
+    photo = getattr(camera, "photo", None)
+    if photo is not None:
+        p = getattr(photo, "path", None)
+        if p:
+            return str(p)
+    for attr in ("image_path", "key"):
+        p = getattr(camera, attr, None)
+        if p and isinstance(p, str) and Path(p).suffix:
+            return p
+    label = getattr(camera, "label", None)
+    if label and Path(label).suffix:
+        return None
+    return None
+
+
 def _build_manifest(chunk: Any, bundle_dir: Path) -> dict:
     """Summarise the bundle for the trainer's preflight (and the UI)."""
-    cameras = [c for c in (chunk.cameras or []) if getattr(c, "transform", None) is not None]
+    all_cams = getattr(chunk, "cameras", []) or []
+    cameras = [c for c in all_cams if getattr(c, "transform", None) is not None]
     return {
         "format": BUNDLE_FORMAT,
         "source": "metashape_export",
@@ -340,6 +345,11 @@ def _peek_image_size(chunk: Any) -> Optional[list[int]]:
     s = sensors[0]
     w = getattr(s, "width", None)
     h = getattr(s, "height", None)
+    if w is None or h is None:
+        cal = getattr(s, "calibration", None)
+        if cal is not None:
+            w = w or getattr(cal, "width", None)
+            h = h or getattr(cal, "height", None)
     if w is None or h is None:
         return None
     return [int(w), int(h)]
@@ -425,6 +435,13 @@ def main() -> None:
             progress=report,
             metashape_module=Metashape,
         )
+    except Exception as exc:
+        import traceback
+        Metashape.app.messageBox(
+            f"Export failed:\n{type(exc).__name__}: {exc}\n\n"
+            f"{traceback.format_exc()}"
+        )
+        return
     finally:
         if progress_ctx is not None:
             try:
