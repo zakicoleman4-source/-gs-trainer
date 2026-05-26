@@ -121,6 +121,11 @@ class TrainerConfig:
     prog_res_mid_fraction: float = 0.40      # then N% of iters at 0.5× res; rest = full
     export_splat_binary: bool = True     # write scene.splat alongside scene.ply
     sh_freq_reg_weight: float = 0.01    # L2 on SH rest; linearly decays to 0 at 50% of iters
+    taming_opacity_enabled: bool = True   # "Taming 3DGS": abs().clamp() opacity after midpoint
+    taming_start_frac: float = 0.5        # training fraction when taming activates
+    fisher_prune_enabled: bool = False    # Fisher info pruning post-training (off by default)
+    fisher_prune_ratio: float = 0.5       # keep this fraction of splats by gradient importance
+    fisher_prune_n_views: int = 20        # training views sampled for gradient accumulation
 
 
 def load_trainer_config(yaml_path: Path, *, iterations_override: Optional[int] = None) -> TrainerConfig:
@@ -195,6 +200,11 @@ def load_trainer_config(yaml_path: Path, *, iterations_override: Optional[int] =
         prog_res_mid_fraction=float(rasterizer_cfg.get("prog_res_mid_fraction", 0.40)),
         export_splat_binary=bool(export_cfg.get("splat_binary", True)),
         sh_freq_reg_weight=float(reg.get("sh_freq_reg_weight", 0.01)),
+        taming_opacity_enabled=bool(raw.get("taming", {}).get("enabled", True)),
+        taming_start_frac=float(raw.get("taming", {}).get("start_frac", 0.5)),
+        fisher_prune_enabled=bool(raw.get("fisher_prune", {}).get("enabled", False)),
+        fisher_prune_ratio=float(raw.get("fisher_prune", {}).get("keep_ratio", 0.5)),
+        fisher_prune_n_views=int(raw.get("fisher_prune", {}).get("n_views", 20)),
     )
 
 
@@ -494,12 +504,22 @@ def train(
                     pg["lr"] = lr_means
                     break
 
+            # Taming 3DGS: after the training midpoint, use abs().clamp() instead of
+            # sigmoid so gradient flow through near-zero opacities is stronger, which
+            # forces low-value Gaussians to either grow or die rather than accumulate
+            # as hazy "Milky Way" artifacts.
+            _opa_for_render = (
+                opacities.abs().clamp(0.0, 1.0)
+                if config.taming_opacity_enabled
+                and step >= int(config.iterations * config.taming_start_frac)
+                else torch.sigmoid(opacities)
+            )
             try:
                 colors, alphas, info = rasterization(
                     means=means,
                     quats=F.normalize(quats, dim=-1),
                     scales=torch.exp(scales),
-                    opacities=torch.sigmoid(opacities),
+                    opacities=_opa_for_render,
                     colors=sh_active,
                     viewmats=w2c[None].to(device),
                     Ks=K_r[None].to(device),
@@ -742,6 +762,36 @@ def train(
                 sh_dc.detach().cpu().numpy(),
                 sh_rest.detach().cpu().numpy(),
             )
+
+        # Optional Fisher information pruning: remove Gaussians that contribute
+        # little to the reconstruction loss across training views.  Disabled by
+        # default because it adds GPU time; useful for client demos where file
+        # size matters more than marginal completeness.
+        if config.fisher_prune_enabled:
+            _before_fisher = int(_final_np[0].shape[0])
+            _log.info(
+                "Fisher pruning: accumulating gradients over %d views, keep %.0f%%...",
+                config.fisher_prune_n_views, config.fisher_prune_ratio * 100,
+            )
+            _final_np = _fisher_prune(
+                *_final_np,
+                scene=scene, train_idx=train_idx, near=near, far=far, device=device,
+                keep_ratio=config.fisher_prune_ratio, n_views=config.fisher_prune_n_views,
+                sh_degree=config.sh_degree,
+            )
+            _log.info(
+                "Fisher pruning: %d → %d splats (%.1f%% kept)",
+                _before_fisher, _final_np[0].shape[0],
+                100.0 * _final_np[0].shape[0] / max(_before_fisher, 1),
+            )
+            write_inria_ply(
+                out_path=final_ply, means=_final_np[0], scales=_final_np[1],
+                quats=_final_np[2], opacities=_final_np[3],
+                sh_dc=_final_np[4], sh_rest=_final_np[5],
+            )
+            if filter_report_dict:
+                filter_report_dict["fisher_n_input"] = _before_fisher
+                filter_report_dict["fisher_n_output"] = int(_final_np[0].shape[0])
 
         # Final per-camera evaluation with the filtered splats.
         _per_cam_stats: list[dict] = []
@@ -1068,3 +1118,99 @@ def _apply_axis_flip_if_needed(
         scene.w2c_per_camera = (flip_np @ scene.w2c_per_camera).astype(np.float64)
     else:
         _log.info("axis-flip auto-detect: no flip needed")
+
+
+def _fisher_prune(
+    means_np: np.ndarray,
+    scales_np: np.ndarray,
+    quats_np: np.ndarray,
+    opacities_np: np.ndarray,
+    sh_dc_np: np.ndarray,
+    sh_rest_np: np.ndarray,
+    *,
+    scene,
+    train_idx: list,
+    near: float,
+    far: float,
+    device,
+    keep_ratio: float = 0.5,
+    n_views: int = 20,
+    sh_degree: int = 3,
+) -> tuple:
+    """Fisher information pruning: keep splats by positional gradient importance.
+
+    Accumulates (∂L/∂means)² per Gaussian over ``n_views`` training images.
+    Gaussians with low gradient magnitude are rarely "seen" or not needed for
+    accurate reconstruction — pruning them reduces file size with minimal loss.
+    Returns a 6-tuple of numpy arrays (same layout as input) for the survivors.
+    """
+    import torch
+    import torch.nn.functional as F
+    from gs_pipeline.trainer.render_eval import _load_camera, _load_image_np, _gather_sh
+
+    means = torch.from_numpy(means_np).float().to(device).requires_grad_(True)
+    scales_t = torch.from_numpy(scales_np).float().to(device)
+    quats_t = torch.from_numpy(quats_np).float().to(device)
+    opacities_t = torch.from_numpy(opacities_np).float().to(device)
+    sh_dc_t = torch.from_numpy(sh_dc_np).float().to(device)
+    sh_rest_t = torch.from_numpy(sh_rest_np).float().to(device)
+
+    n = means.shape[0]
+    fisher_scores = torch.zeros(n, device=device)
+
+    rng_np = np.random.default_rng(99)
+    view_indices = list(train_idx)
+    if len(view_indices) > n_views:
+        view_indices = list(rng_np.choice(len(view_indices), n_views, replace=False))
+        view_indices = [train_idx[i] for i in view_indices]
+
+    sh_active = _gather_sh(sh_dc_t, sh_rest_t, sh_degree, sh_degree)
+
+    from gsplat import rasterization as _gs_rasterize
+    n_accumulated = 0
+    for cam_i in view_indices:
+        K, w2c, image_path = _load_camera(scene, cam_i)
+        target_np = _load_image_np(image_path, 1.0)
+        target = torch.from_numpy(target_np).to(device)
+        try:
+            with torch.enable_grad():
+                if means.grad is not None:
+                    means.grad.zero_()
+                colors, _alphas, _info = _gs_rasterize(
+                    means=means,
+                    quats=F.normalize(quats_t, dim=-1),
+                    scales=torch.exp(scales_t),
+                    opacities=torch.sigmoid(opacities_t),
+                    colors=sh_active,
+                    viewmats=w2c[None].to(device),
+                    Ks=K[None].to(device),
+                    width=target.shape[1],
+                    height=target.shape[0],
+                    near_plane=near,
+                    far_plane=far,
+                    sh_degree=sh_degree,
+                )
+                pred = colors[0, :, :, :3].clamp(0.0, 1.0)
+                loss = (pred - target).abs().mean()
+                loss.backward()
+            if means.grad is not None:
+                fisher_scores += means.grad.detach().pow(2).sum(dim=1)
+                n_accumulated += 1
+        except Exception as _e:
+            _log.debug("Fisher prune skipped view %d: %s", cam_i, _e)
+            continue
+
+    if n_accumulated == 0:
+        _log.warning("Fisher pruning: no views succeeded; returning all splats unchanged")
+        return means_np, scales_np, quats_np, opacities_np, sh_dc_np, sh_rest_np
+
+    k_keep = max(1, int(n * keep_ratio))
+    _, top_idx = torch.topk(fisher_scores, k_keep)
+    mask_gpu = torch.zeros(n, dtype=torch.bool, device=device)
+    mask_gpu[top_idx] = True
+    mask = mask_gpu.cpu().numpy()
+
+    return (
+        means_np[mask], scales_np[mask], quats_np[mask],
+        opacities_np[mask], sh_dc_np[mask], sh_rest_np[mask],
+    )

@@ -107,6 +107,15 @@ preview:
   strip_width: 3     # number of panels in preview strip (left/center/right holdout cameras)
   panel_height: 400  # pixels tall for each panel in the strip
 
+taming:
+  enabled: true       # "Taming 3DGS": abs().clamp() opacity after training midpoint
+  start_frac: 0.5     # fraction of training when the switch activates
+
+fisher_prune:
+  enabled: false      # gradient-based importance pruning post-filter (adds ~5 min)
+  keep_ratio: 0.5     # fraction of splats to keep by positional gradient magnitude
+  n_views: 20         # training views sampled for gradient accumulation
+
 appearance:
   enabled: false   # enable for drone footage with auto-exposure variation
   lr: 0.01         # learning rate for per-camera exposure scalars

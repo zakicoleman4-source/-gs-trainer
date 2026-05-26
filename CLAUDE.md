@@ -146,16 +146,25 @@ Disabled by default (`appearance.enabled: false` in config.yaml). Applied only t
 the photometric loss; discarded from final PLY.
 
 ### Post-training filter (`filter_splats.py`)
-Three-stage chain applied after training when `filter.enabled: true` (default on):
+Four-stage chain applied after training when `filter.enabled: true` (default on):
 1. **Opacity** — drops splats with `sigmoid(logit) < filter.min_opacity` (default 0.005)
 2. **Scale** — drops splats whose max axis scale exceeds `filter.max_scale_factor × median_scale`
 3. **SOR** — statistical outlier removal via k-NN (k=`filter.sor_k`, cutoff at
    `mean_dist + sor_std_ratio × std_dist`). Uses `scipy.spatial.KDTree` (O(N log N));
    falls back to brute-force block multiply for N ≤ 50k when scipy is absent.
+4. **Fisher pruning** (optional, default off) — accumulates `(∂L/∂means)²` over
+   `fisher_prune.n_views` training images; keeps top `fisher_prune.keep_ratio` fraction
+   by importance score. Enable in config.yaml: `fisher_prune: {enabled: true}`.
 
 Pipeline saves `scene_unfiltered.ply` as backup before overwriting `scene.ply`.
-All filter params live under `filter:` in `config.yaml`; all default to sensible values.
+All filter params live under `filter:` and `fisher_prune:` in `config.yaml`.
 scipy is required for SOR on large scenes — it is in `requirements-cpu.txt` (≥ 1.12).
+
+### Taming 3DGS (`taming:` in config.yaml)
+After `taming.start_frac` (default 50%) of training, the opacity activation switches
+from `sigmoid(x)` to `abs(x).clamp(0, 1)`. This forces low-opacity Gaussians to either
+contribute or be pruned — eliminates hazy "Milky Way" artifacts seen with MCMC in
+indoor/uniform-background scenes. Controlled by `taming.enabled` (default true).
 
 ## VRAM class → max_image_side table (budget.py)
 | VRAM      | max_image_side |
@@ -268,6 +277,18 @@ Pipeline flow:
 `optimizeCameras()` also now runs automatically before every bundle export (fisheye-aware:
 adds `fit_k4=True` when fisheye sensors detected). Wrapped in try/except so export continues
 if it fails.
+
+---
+
+## Session coordination (multi-session state)
+
+**This session (MCMC quality + UI)** owns: `train_mcmc.py`, `filter_splats.py`, `export_ply.py`,
+`render_eval.py`, `ui/live_view.py`, `pipeline.py` (shared, coordinate carefully).
+
+**Other session (Scaffold-GS)** owns: `train_scaffold.py`. Do NOT modify that file.
+Already merged: Scaffold-GS trainer, `trainer.backend` config key, `scaffold:` config section.
+
+When touching `pipeline.py` or `config.yaml`, pull first and rebase to avoid conflicts.
 
 ---
 
