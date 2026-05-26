@@ -146,8 +146,11 @@ def _load_ply_xyz_rgb(ply_path: Path) -> tuple[np.ndarray, np.ndarray]:
     g = np.asarray(v[color_keys[1]])
     b = np.asarray(v[color_keys[2]])
     rgb = np.stack([r, g, b], axis=1).astype(np.float32)
-    # Detect uint8 colors (0..255) vs float (0..1).
-    if rgb.max(initial=0.0) > 1.5:
+    # Detect integer colors: uint8 (0..255) or uint16 (0..65535) vs float (0..1).
+    max_val = rgb.max(initial=0.0)
+    if max_val > 255.5:
+        rgb = rgb / 65535.0
+    elif max_val > 1.5:
         rgb = rgb / 255.0
     rgb = np.clip(rgb, 0.0, 1.0).astype(np.float32)
     return xyz, rgb

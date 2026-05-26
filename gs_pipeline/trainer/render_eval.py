@@ -140,7 +140,7 @@ def evaluate_holdout(
             pred_np = pred.detach().cpu().numpy()
             psnrs.append(psnr(pred_np, target_np))
             ssims.append(ssim(pred_np, target_np))
-    return float(np.mean(psnrs)) if psnrs else 0.0, float(np.mean(ssims)) if ssims else 0.0
+    return float(np.mean(psnrs)) if psnrs else float("nan"), float(np.mean(ssims)) if ssims else float("nan")
 
 
 def save_preview_png(

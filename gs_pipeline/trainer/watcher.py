@@ -120,8 +120,6 @@ def process_one_subprocess(
     job_id = _job_id_from_claim(zip_path)
     log_dir = job_log_dir(paths.logs, job_id)
     log_dir.mkdir(parents=True, exist_ok=True)
-    out_log = (log_dir / "runner.out").open("ab")
-    err_log = (log_dir / "runner.err").open("ab")
     env = os.environ.copy()
     cmd = [
         python, "-m", "gs_pipeline.trainer.pipeline",
@@ -135,9 +133,10 @@ def process_one_subprocess(
     if paths.config_yaml is not None:
         cmd += ["--config-yaml", str(paths.config_yaml)]
     _log.info("spawning trainer for job %s: %s", job_id, " ".join(cmd))
-    proc = subprocess.Popen(cmd, stdout=out_log, stderr=err_log, env=env)
-    proc.wait()  # block until done; only one job at a time on this GPU
-    out_log.close(); err_log.close()
+    with (log_dir / "runner.out").open("ab") as out_log, \
+         (log_dir / "runner.err").open("ab") as err_log:
+        proc = subprocess.Popen(cmd, stdout=out_log, stderr=err_log, env=env)
+        proc.wait()
     _log.info("trainer for job %s exited with code %s", job_id, proc.returncode)
     return zip_path
 
@@ -178,9 +177,14 @@ def _claim_next(inbox: Path) -> Optional[Path]:
     unclaimed zip exists.
     """
     inbox = Path(inbox)
+    def _safe_mtime(p: Path) -> float:
+        try:
+            return p.stat().st_mtime
+        except OSError:
+            return float("inf")
     candidates = sorted(
         (p for p in inbox.glob("*.zip") if not p.name.startswith(CLAIM_PREFIX)),
-        key=lambda p: p.stat().st_mtime,
+        key=_safe_mtime,
     )
     for candidate in candidates:
         job_id = uuid.uuid4().hex[:12]

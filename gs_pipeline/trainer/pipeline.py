@@ -149,7 +149,9 @@ def run_job(
         _log.info("job %s done; outputs=%s", job_id, asdict(outputs))
         return js
 
-    except BaseException as exc:  # broad: this function must never re-raise
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException as exc:
         tb = traceback.format_exc()
         (log_dir / "pipeline_error.txt").write_text(tb, encoding="utf-8")
         try:

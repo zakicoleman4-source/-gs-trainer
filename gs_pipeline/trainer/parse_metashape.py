@@ -267,7 +267,11 @@ def parse_cameras_xml(
             warnings.append(f"camera {label}: {e}; skipped")
             continue
         # Invert to get w2c (Agisoft <transform> is camera->chunk, i.e. c2w).
-        w2c = np.linalg.inv(c2w)
+        try:
+            w2c = np.linalg.inv(c2w)
+        except np.linalg.LinAlgError:
+            warnings.append(f"camera {label}: singular c2w matrix; skipped")
+            continue
 
         K = sensor.K()
 

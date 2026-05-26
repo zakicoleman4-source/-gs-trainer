@@ -233,7 +233,11 @@ class JobState:
                 f"(expected {SCHEMA_VERSION})"
             )
         preflight_d = d.get("preflight")
-        preflight = PreflightSnapshot(**preflight_d) if preflight_d else None
+        if preflight_d:
+            valid_keys = {f.name for f in __import__("dataclasses").fields(PreflightSnapshot)}
+            preflight = PreflightSnapshot(**{k: v for k, v in preflight_d.items() if k in valid_keys})
+        else:
+            preflight = None
         progress_d = d.get("progress") or {}
         outputs_d = d.get("outputs") or {}
         return cls(
