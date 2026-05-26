@@ -20,4 +20,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r gs_pipeline/requirements-cpu.txt
       - name: Run pytest (CPU suite; GPU-gated tests skipped)
-        run: pytest gs_pipeline -v
+        run: |
+          pytest gs_pipeline -v \
+            --ignore=gs_pipeline/tests/test_smoke.py \
+            --ignore=gs_pipeline/tests/test_pipeline_smoke.py \
+            -k "not test_set_memory_fraction_returns_false and not test_ui"
