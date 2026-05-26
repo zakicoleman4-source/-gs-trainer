@@ -198,62 +198,28 @@ def run_job(
                 _log.info("appearance conditioning auto-enabled (exposure variation detected)")
 
         # OOM retry ladder: try training, on CUDA OOM reduce resolution and retry.
-        # Up to 3 attempts: full → 75% → 56% resolution. Never crash.
+        # Up to 4 attempts: full → 75% → 56% → 42% resolution. Never crash.
+        # Block partitioning is NOT used for interior scenes (kitchen/den/street) —
+        # it's reserved for future city-scale support.
         from gs_pipeline.trainer.oom_guard import is_cuda_oom, clear_cuda_cache
-        from gs_pipeline.trainer.scene_partition import should_partition
 
-        _max_oom_retries = 3
+        _max_oom_retries = 4
         for _oom_attempt in range(_max_oom_retries):
             try:
-                if train_fn is None and should_partition(len(scene)):
-                    from gs_pipeline.trainer.large_scene import run_large_scene
-                    _log.info(
-                        "Large scene detected (%d cameras >= 500); using block-partitioned training.",
-                        len(scene),
-                    )
-                    outputs = run_large_scene(
-                        scene=scene, init_cloud=init_cloud, budget=budget,
-                        config=_cfg, job_state=js, job_state_path=state_path,
-                        work_dir=work_dir, outbox_dir=outbox_dir,
-                    )
+                if train_fn is not None:
+                    trainer = train_fn
+                elif _backend == "scaffold":
+                    from gs_pipeline.trainer.train_scaffold import train as _scaffold_train
+                    trainer = _scaffold_train
                 else:
-                    if train_fn is not None:
-                        trainer = train_fn
-                    elif _backend == "scaffold":
-                        from gs_pipeline.trainer.train_scaffold import train as _scaffold_train
-                        trainer = _scaffold_train
-                    else:
-                        trainer = _default_train_fn
-                    outputs = trainer(
-                        scene=scene, init_cloud=init_cloud, budget=budget,
-                        config=_cfg, job_state=js, job_state_path=state_path,
-                        work_dir=work_dir, outbox_dir=outbox_dir,
-                    )
+                    trainer = _default_train_fn
+                outputs = trainer(
+                    scene=scene, init_cloud=init_cloud, budget=budget,
+                    config=_cfg, job_state=js, job_state_path=state_path,
+                    work_dir=work_dir, outbox_dir=outbox_dir,
+                )
                 break  # success
             except Exception as _train_exc:
-                # _NeedPartitioning: in-loop OOM recovery fired 2+ times,
-                # scene is too large for single-shot — switch to block training.
-                from gs_pipeline.trainer.train_mcmc import _NeedPartitioning
-                if isinstance(_train_exc, _NeedPartitioning):
-                    clear_cuda_cache()
-                    _log.warning(
-                        "Switching to block-partitioned training: %s", _train_exc,
-                    )
-                    js.status_msg = "Switching to block-partitioned training (scene too large for single-shot)"
-                    write_state(js, state_path)
-                    from gs_pipeline.trainer.large_scene import run_large_scene
-                    from dataclasses import replace as _replace2
-                    _reduced_budget = _replace2(budget,
-                        target_splats=max(500_000, budget.target_splats // 2),
-                        hard_cap_splats=max(500_000, budget.hard_cap_splats // 2),
-                    )
-                    _reduced_budget.notes.append("Auto-partitioned after repeated OOM in single-shot mode")
-                    outputs = run_large_scene(
-                        scene=scene, init_cloud=init_cloud, budget=_reduced_budget,
-                        config=_cfg, job_state=js, job_state_path=state_path,
-                        work_dir=work_dir, outbox_dir=outbox_dir,
-                    )
-                    break
                 if not is_cuda_oom(_train_exc) or _oom_attempt >= _max_oom_retries - 1:
                     raise  # not OOM or last attempt — propagate
                 clear_cuda_cache()

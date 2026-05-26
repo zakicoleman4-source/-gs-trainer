@@ -925,15 +925,10 @@ def _oom_recovery(
     clear_cuda_cache()
 
     n_before = means.shape[0]
-    if oom_count >= 2:
-        raise _NeedPartitioning(
-            f"OOM recovery fired {oom_count + 1} times at step {step} "
-            f"({n_before:,} splats). Switching to block-partitioned training."
-        )
-    if n_before < 10_000:
+    if oom_count >= 5 or n_before < 10_000:
         raise RuntimeError(
-            f"OOM recovery exhausted (only {n_before:,} splats remaining). "
-            f"GPU memory too small for this scene."
+            f"OOM recovery exhausted after {oom_count + 1} attempts "
+            f"({n_before:,} splats remaining). GPU memory too small for this scene."
         )
 
     keep_n = max(int(n_before * 0.75), 10_000)
