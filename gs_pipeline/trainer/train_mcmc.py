@@ -844,6 +844,19 @@ def train(
             "preflight": job_state.preflight.__dict__ if job_state.preflight else None,
             "filter": filter_report_dict if filter_report_dict else None,
         }
+
+        from gs_pipeline.trainer.quality_report import generate_quality_report
+        qr = generate_quality_report(
+            scene=scene, init_cloud=init_cloud, budget=budget,
+            psnr_history=job_state.progress.psnr_history,
+            ssim_history=job_state.progress.ssim_history,
+            final_splat_count=_final_count,
+            filter_report=filter_report_dict if filter_report_dict else None,
+            image_max_side=budget.image_max_side,
+        )
+        report["quality_report"] = qr.to_dict()
+        _log.info("\n%s", qr.summary_text())
+
         (work_dir / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
 
         # Compile timelapse if we collected frames.

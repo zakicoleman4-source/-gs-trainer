@@ -267,13 +267,46 @@ def save_preview_strip(
 
             panels.append(np.asarray(img_panel, dtype=np.uint8))
 
-    # Build strip: panels separated by white vertical bars
+    # Build strip: GT on top, render on bottom for each camera, separated by white bars
     strip_parts: list[np.ndarray] = []
-    separator = np.full((target_height_px, SEPARATOR_WIDTH, 3), 255, dtype=np.uint8)
-    for idx, panel in enumerate(panels):
-        if idx > 0:
-            strip_parts.append(separator)
-        strip_parts.append(panel)
+    separator = np.full((target_height_px * 2 + 2, SEPARATOR_WIDTH, 3), 255, dtype=np.uint8)
+
+    with torch.no_grad():
+        for pair_idx, cam_i in enumerate(selected):
+            ds = downscale_per_camera[cam_i] if downscale_per_camera is not None else downscale
+            K_gt, w2c_gt, img_path = _load_camera(scene, cam_i, downscale=ds)
+            gt_np = _load_image_np(img_path, ds)
+            h_gt, w_gt = gt_np.shape[:2]
+            new_w = max(1, int(round(w_gt * target_height_px / h_gt)))
+            gt_img = Image.fromarray((gt_np * 255).clip(0, 255).astype(np.uint8)).resize(
+                (new_w, target_height_px), Image.LANCZOS)
+            # Label GT
+            try:
+                from PIL import ImageDraw, ImageFont
+                draw = ImageDraw.Draw(gt_img)
+                try:
+                    font = ImageFont.load_default(size=14)
+                except TypeError:
+                    font = ImageFont.load_default()
+                draw.text((11, 9), "GT", fill=(0, 0, 0), font=font)
+                draw.text((10, 8), "GT", fill=(255, 255, 255), font=font)
+            except Exception:
+                pass
+
+            gt_arr = np.asarray(gt_img, dtype=np.uint8)
+            # Render panel is already in `panels` list at same index
+            render_arr = panels[pair_idx]
+            # Match widths
+            min_w = min(gt_arr.shape[1], render_arr.shape[1])
+            gt_arr = gt_arr[:, :min_w]
+            render_arr = render_arr[:, :min_w]
+            # Thin white line between GT and render
+            hline = np.full((2, min_w, 3), 255, dtype=np.uint8)
+            pair = np.concatenate([gt_arr, hline, render_arr], axis=0)
+
+            if pair_idx > 0:
+                strip_parts.append(separator)
+            strip_parts.append(pair)
 
     strip = np.concatenate(strip_parts, axis=1)
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
