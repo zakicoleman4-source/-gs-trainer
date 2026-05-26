@@ -687,8 +687,8 @@ def train(
                 job_state.outputs.preview_strip_png = str(strip_path)
                 job_state.outputs.preview_png = str(strip_path)
                 write_state(job_state, job_state_path)
-                # Archive one frame per checkpoint window for the timelapse.
-                if step % config.checkpoint_every == 0 and config.timelapse_enabled:
+                # Archive every eval-aligned preview for the timelapse video.
+                if config.timelapse_enabled and step % config.eval_every == 0:
                     import shutil as _shutil
                     tl_dir = work_dir / "timelapse_frames"
                     tl_dir.mkdir(exist_ok=True)
