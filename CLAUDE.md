@@ -23,6 +23,59 @@ Streamlit web UI running in Docker, and get a trained `scene.ply` output.
 - `gs_pipeline/ui/app.py` — Streamlit UI (upload, preflight, live dashboard, downloads)
 - `gs_pipeline/docker/` — Dockerfile, docker-compose.yml, entrypoint.sh, supervisord.conf
 
+## Multi-session protocol — READ THIS FIRST
+
+Multiple Claude sessions may work on this repo in parallel. Follow these rules
+every time, no exceptions. Conflicts and overwritten work happen when sessions
+ignore them.
+
+### 1. Always pull before you start
+```bash
+git pull origin main
+```
+
+### 2. Always work on a feature branch — never commit directly to main
+```bash
+git checkout -b feat/short-description   # e.g. feat/ui-filter-comparison
+# ... do your work ...
+git push origin feat/short-description
+```
+Then open a PR, or if you're the only session active right now and it's a tiny
+fix, you may push directly to main **only after confirming no other session is
+mid-work** (check `session_state.md` in memory/).
+
+### 3. Claim your work in memory/session_state.md before starting
+Edit `/home/tarbut/.claude/projects/-home-tarbut-Music-aj-aj-projects-gs-pipeline/memory/session_state.md`
+and add a line: `[YOUR-BRANCH] — what you're doing`. Remove it when you merge.
+This is the only way parallel sessions know not to touch the same files.
+
+### 4. Check session_state.md before touching any file
+If another session has claimed a file, work around it or coordinate via the
+user. Never blindly overwrite in-progress work.
+
+### 5. Run tests before every push
+```bash
+python3 -m pytest gs_pipeline/tests/ -q \
+  --ignore=gs_pipeline/tests/test_smoke.py \
+  --ignore=gs_pipeline/tests/test_pipeline_smoke.py \
+  -k "not test_set_memory_fraction_returns_false and not test_ui"
+```
+Do not push a branch that breaks the test suite.
+
+### 6. Update CLAUDE.md and memory when you finish
+After merging: update the "Pending work" section in this file, and update
+`memory/project_gs_trainer.md` with what changed. This keeps the next session
+fully briefed.
+
+### Docker
+Docker only rebuilds on version tags. Do NOT manually trigger a Docker build
+during active development. When a feature is client-ready:
+```bash
+git tag v0.X.Y && git push origin v0.X.Y
+```
+
+---
+
 ## Running tests
 ```bash
 pip install -r gs_pipeline/requirements-cpu.txt
