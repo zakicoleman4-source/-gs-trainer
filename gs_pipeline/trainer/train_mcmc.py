@@ -398,14 +398,15 @@ def train(
     quats.requires_grad_(True); opacities.requires_grad_(True)
     sh_dc.requires_grad_(True); sh_rest.requires_grad_(True)
 
-    optimizer = torch.optim.Adam([
-        {"params": [means], "lr": 0.00016 * init_cloud.scene_extent, "name": "means"},
-        {"params": [scales], "lr": 0.005, "name": "scales"},
-        {"params": [quats], "lr": 0.001, "name": "quats"},
-        {"params": [opacities], "lr": 0.05, "name": "opacities"},
-        {"params": [sh_dc], "lr": 0.0025, "name": "sh_dc"},
-        {"params": [sh_rest], "lr": 0.0025 / 20.0, "name": "sh_rest"},
-    ])
+    # gsplat MCMCStrategy expects a dict of per-parameter optimizers.
+    optimizers = {
+        "means": torch.optim.Adam([means], lr=0.00016 * init_cloud.scene_extent),
+        "scales": torch.optim.Adam([scales], lr=0.005),
+        "quats": torch.optim.Adam([quats], lr=0.001),
+        "opacities": torch.optim.Adam([opacities], lr=0.05),
+        "sh_dc": torch.optim.Adam([sh_dc], lr=0.0025),
+        "sh_rest": torch.optim.Adam([sh_rest], lr=0.0025 / 20.0),
+    }
 
     # Per-camera appearance: learnable log-exposure (R, G, B) per image.
     # Applied only to loss computation; discarded after training.
@@ -499,10 +500,8 @@ def train(
             lr_means = _means_lr_at_step(
                 step, config.iterations, means_lr_init, config.means_lr_final_factor,
             )
-            for pg in optimizer.param_groups:
-                if pg["name"] == "means":
-                    pg["lr"] = lr_means
-                    break
+            for pg in optimizers["means"].param_groups:
+                pg["lr"] = lr_means
 
             # Taming 3DGS: after the training midpoint, use abs().clamp() instead of
             # sigmoid so gradient flow through near-zero opacities is stronger, which
@@ -587,17 +586,19 @@ def train(
                 if _sh_decay > 0.0:
                     loss = loss + config.sh_freq_reg_weight * _sh_decay * (sh_rest ** 2).mean()
 
-            optimizer.zero_grad(set_to_none=True)
+            for opt in optimizers.values():
+                opt.zero_grad(set_to_none=True)
 
             strategy.step_pre_backward(
                 params=_strategy_params(means, scales, quats, opacities, sh_dc, sh_rest),
-                optimizers=optimizer, state=strategy_state, step=step, info=info,
+                optimizers=optimizers, state=strategy_state, step=step, info=info,
             )
             loss.backward()
-            optimizer.step()
+            for opt in optimizers.values():
+                opt.step()
             strategy.step_post_backward(
                 params=_strategy_params(means, scales, quats, opacities, sh_dc, sh_rest),
-                optimizers=optimizer, state=strategy_state, step=step, info=info,
+                optimizers=optimizers, state=strategy_state, step=step, info=info,
                 lr=lr_means,
             )
 
