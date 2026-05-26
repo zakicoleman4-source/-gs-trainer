@@ -533,7 +533,39 @@ def train(
                 )
             except torch.cuda.OutOfMemoryError:
                 clear_cuda_cache()
-                raise
+                # Emergency prune: kill the weakest 20% of splats by opacity
+                n_before = means.shape[0]
+                keep_n = max(int(n_before * 0.8), 1000)
+                opa_vals = torch.sigmoid(opacities.detach())
+                _, keep_idx = torch.topk(opa_vals, keep_n)
+                keep_idx = keep_idx.sort().values
+                means = means[keep_idx].detach().requires_grad_(True)
+                scales = scales[keep_idx].detach().requires_grad_(True)
+                quats = quats[keep_idx].detach().requires_grad_(True)
+                opacities = opacities[keep_idx].detach().requires_grad_(True)
+                sh_dc = sh_dc[keep_idx].detach().requires_grad_(True)
+                sh_rest = sh_rest[keep_idx].detach().requires_grad_(True)
+                # Reduce cap_max so MCMC doesn't grow back immediately
+                strategy.cap_max = keep_n
+                # Rebuild optimizers for pruned params
+                optimizers = {
+                    "means": torch.optim.Adam([means], lr=lr_means),
+                    "scales": torch.optim.Adam([scales], lr=0.005),
+                    "quats": torch.optim.Adam([quats], lr=0.001),
+                    "opacities": torch.optim.Adam([opacities], lr=0.05),
+                    "sh_dc": torch.optim.Adam([sh_dc], lr=0.0025),
+                    "sh_rest": torch.optim.Adam([sh_rest], lr=0.0025 / 20.0),
+                }
+                strategy_state = strategy.initialize_state()
+                clear_cuda_cache()
+                _log.warning(
+                    "OOM at step %d: emergency pruned %d -> %d splats (cap_max=%d). Continuing.",
+                    step, n_before, keep_n, keep_n,
+                )
+                job_state.tick(current_step=step, current_splats=keep_n, loss=float('nan'))
+                job_state.status_msg = f"Recovered from memory pressure at step {step} — pruned to {keep_n:,} splats"
+                write_state(job_state, job_state_path)
+                continue
 
             pred = colors[0, :, :, :3]    # (H, W, 3) RGB
             depth = colors[0, :, :, 3:4]  # (H, W, 1) camera-space depth
