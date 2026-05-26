@@ -224,11 +224,86 @@ Uses gsplat `rasterization(sh_degree=None)` with raw RGB — no SH, no new CUDA 
 
 Config: `scaffold:` section in config.yaml. `ScaffoldConfig` dataclass in `train_scaffold.py`.
 
+## Metashape dense cloud export — client guidance (IMPORTANT)
+
+Clients ask whether to export the full 50M-point cloud or decimate to 500k.
+The correct answer is: **export the full density of the ROI, don't manually decimate**.
+
+Why this matters for the pipeline:
+- `init_from_pcd.py` voxel-downsamples to ≤1M points regardless of input size.
+  More input points = better spatial distribution in the 1M init cloud = better Gaussian initialization.
+- `scene_extent` is computed from the point cloud AABB. If background/walls are
+  included, extent inflates → means LR (`0.00016 * scene_extent` in train_mcmc.py) is wrong.
+- `budget.py` uses `dense_pts` (after downsampling) for the `geom` splat budget signal.
+
+**Correct client workflow in Metashape:**
+1. Build dense cloud at High or Ultra High quality.
+2. Use Metashape's dense cloud classifier or manual selection to remove noise,
+   background walls, ground outside the ROI. Do NOT delete subject detail.
+3. Export whatever point count remains (2M, 20M — all fine). The pipeline handles it.
+4. Never manually decimate to a round number. Let the pipeline's voxel downsampler
+   produce the 1M init cloud — it's O(N log N) and fast.
+
+**20M points from a large area at Ultra High = perfect input.**
+The only concern is whether those points are clean (no Metashape artifacts, reflective
+surface noise, sky bleed). Use Metashape's classify/clean tools, not decimation.
+
+Also: always export **with colors** (`Save point colors` checked). Without colors,
+Gaussian initialization starts gray and needs extra iterations to converge on appearance.
+
+---
+
+## Mask support (added 2026-05-26, commit 2cd4d5a)
+
+`export_for_splat.py` now exports per-camera masks from the Metashape chunk into
+`masks/` inside the bundle zip (white=excluded, black=keep — Metashape convention).
+
+Pipeline flow:
+- `pipeline.py` detects `masks/` dir in bundle, passes `masks_dir` to `parse_cameras_xml()`
+- `ParsedScene.mask_paths` — list parallel to `image_labels`, `None` for cameras without mask
+- `train_mcmc.py` loads each camera's mask as a validity tensor (inverted: 1=keep, 0=excluded),
+  zeroes masked pixels in `pred` and `target_img` before computing L1 + SSIM loss
+- Masked regions contribute zero gradient → Gaussians don't form in excluded areas
+
+`optimizeCameras()` also now runs automatically before every bundle export (fisheye-aware:
+adds `fit_k4=True` when fisheye sensors detected). Wrapped in try/except so export continues
+if it fails.
+
+---
+
 ## Pending work
+
+### Ready to implement (discussed, approach agreed)
+
+**A — Iteration auto-scaling** (`budget.py` + `auto_adjust_config_for_scene` in `train_mcmc.py`)
+- Signal: `dense_pts / n_cameras` — overlap quality proxy from Metashape dense cloud
+  - < 5,000 pts/cam → sparse capture → add 30% more iterations
+  - 5k–30k pts/cam → normal
+  - > 30k pts/cam → dense, could reduce iterations slightly
+- Base formula: `iterations = 40_000 * sqrt(n_cameras / 150)` (Auto preset)
+- `budget.py` has all inputs; pass adjusted iterations into TrainerConfig
+- Do NOT touch the fixed 40k/100k presets — make this additive scaling on top of them
+
+**B — Preflight quality warning for sparse captures** (`ui/preflight.py`, `PreflightReport`)
+- Add `overlap_density: float` field = `dense_pts / n_cameras` to `PreflightReport`
+- Add warning string when `overlap_density < 5_000`: "Dense cloud is sparse
+  (X pts/camera). Check image overlap in Metashape before training."
+- Show in preflight screen before user hits Start
+- `PreflightReport` already has `dense_pts` and `n_cameras` — trivial to add
+
+**C — Dynamic depth regularization** (`auto_adjust_config_for_scene` in `train_mcmc.py`)
+- `depth_reg_weight` is currently static in config.yaml (0.001)
+- When `overlap_density < 5_000` or `n_cameras < 50`: raise to 0.01
+- When `overlap_density > 30_000`: set to 0 (dense cloud makes it redundant)
+- Avoids fighting depth reg on already-excellent captures
+
+### Other pending
 - UI: filter comparison view (let user choose filter level and download)
+- UI preflight: show large-scene mode info (block count, cameras per block)
 - Validate `export_for_splat.py` Metashape script on actual Metashape Pro install
 - GTX 1080 (sm_61) needs patched gsplat; Docker build on Volta+ is fine
 - GPU smoke test Scaffold-GS on real data
+- Add `validate_chunk()` warning if dense cloud has no color data (export with colors is required)
 
 ## Repo
 https://github.com/zakicoleman4-source/-gs-trainer (private)
