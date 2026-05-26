@@ -135,7 +135,7 @@ def test_compose_default_env_knobs_present():
     env = svc.get("environment", {})
     if isinstance(env, list):
         env = dict(e.split("=", 1) for e in env)
-    for key in ("MAX_UPLOAD_GB", "QUALITY_PRESET_DEFAULT", "MAX_IMAGE_SIDE"):
+    for key in ("MAX_UPLOAD_GB", "QUALITY_PRESET_DEFAULT"):
         assert key in env
 
 

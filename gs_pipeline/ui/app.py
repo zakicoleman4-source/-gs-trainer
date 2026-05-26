@@ -105,6 +105,15 @@ def _phase_preflight() -> None:
             f"by {report.downscale_factor:.2f} for training. Final eval and "
             f"the exported splat are still in full detail."
         )
+    if report.is_large_scene:
+        rows, cols = report.block_grid
+        st.warning(
+            f"**Large scene detected** — {report.n_cameras} cameras exceeds "
+            f"the 500-camera threshold. Training will partition into a "
+            f"**{rows} x {cols} grid** ({report.n_blocks} blocks, "
+            f"~{report.n_cameras // report.n_blocks} cameras per block). "
+            f"Each block trains independently and results are merged into one PLY."
+        )
     for w in report.warnings:
         st.warning(w)
 

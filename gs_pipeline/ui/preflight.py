@@ -19,6 +19,7 @@ from typing import Optional
 from gs_pipeline.trainer.budget import Budget, GPUInfo, compute_budget, detect_gpu
 from gs_pipeline.trainer.init_from_pcd import load_and_downsample
 from gs_pipeline.trainer.parse_metashape import parse_cameras_xml
+from gs_pipeline.trainer.scene_partition import should_partition, _auto_grid_size
 
 
 @dataclass
@@ -39,6 +40,10 @@ class PreflightReport:
     gpu_total_vram_bytes: int
     warnings: list[str]
     budget: Budget              # full Budget for downstream use
+    is_large_scene: bool = False
+    n_blocks: int = 1
+    block_grid: tuple[int, int] = (1, 1)
+    cameras_per_block: list[int] = None
 
 
 def estimate_training_minutes(target_splats: int, iterations: int) -> float:
@@ -110,6 +115,19 @@ def run_preflight(
     warnings: list[str] = []
     warnings.extend(scene.warnings)
     warnings.extend(budget.notes)
+
+    n_cams = budget.n_cameras
+    large = should_partition(n_cams)
+    if large:
+        rows, cols = _auto_grid_size(n_cams)
+        n_blk = rows * cols
+        avg = n_cams // n_blk
+        cams_per_block = [avg] * n_blk
+    else:
+        rows, cols = 1, 1
+        n_blk = 1
+        cams_per_block = [n_cams]
+
     return PreflightReport(
         n_cameras=budget.n_cameras,
         image_max_side_orig=int(longest_side),
@@ -127,4 +145,8 @@ def run_preflight(
         gpu_total_vram_bytes=budget.gpu.total_vram_bytes,
         warnings=warnings,
         budget=budget,
+        is_large_scene=large,
+        n_blocks=n_blk,
+        block_grid=(rows, cols),
+        cameras_per_block=cams_per_block,
     )

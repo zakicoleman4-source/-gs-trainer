@@ -138,10 +138,29 @@ scipy is required for SOR on large scenes — it is in `requirements-cpu.txt` (�
 All quality knobs are auto-tuned. User only picks "Auto" vs "Maximum" preset.
 The pipeline should produce publication-quality splats with zero manual tuning.
 
+## Post-training filtering (`filter_splats.py`)
+Three filters chained automatically after training (configurable in config.yaml `filter:` section):
+1. **Opacity** — removes near-transparent splats (`sigmoid(logit) < min_opacity`)
+2. **Scale** — removes oversized splats (`exp(scale) > median * max_scale_factor`)
+3. **SOR** — Statistical Outlier Removal via scipy KDTree (`mean_dist > global_mean + std_ratio * std`)
+
+Saves `scene_unfiltered.ply` backup + overwrites `scene.ply` with filtered result.
+Filter stats included in `report.json`.
+
+User can compare filter levels: no_filter, light, default, aggressive, extreme.
+
+## Docker notes
+- `scipy` added to requirements-cpu.txt (needed by knn_mean_distance + filter SOR)
+- `ffmpeg` added to Dockerfile (needed for training timelapse)
+- `TORCH_CUDA_ARCH_LIST` expanded to include Volta (7.0) and Turing (7.5)
+- `MAX_IMAGE_SIDE` removed from docker-compose.yml (now VRAM-adaptive via budget.py)
+
 ## Pending work
+- UI: filter comparison view (let user choose filter level and download)
 - UI preflight screen: show large-scene mode info (block count, cameras per block)
 - UI filter comparison view: show before/after splat counts + per-filter breakdown in job dashboard
 - Validate `export_for_splat.py` Metashape script on actual Metashape Pro install
+- GTX 1080 (sm_61) needs patched gsplat (labeled_partition -> coalesced_threads); Docker build on Volta+ is fine
 
 ## Repo
 https://github.com/zakicoleman4-source/-gs-trainer (private)

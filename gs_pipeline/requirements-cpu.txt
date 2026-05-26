@@ -2,6 +2,7 @@
 # Metashape-side export script (when run outside Metashape for dry-run tests).
 # The full trainer needs the GPU stack in requirements-gpu.txt as well.
 numpy>=1.26
+scipy>=1.12
 plyfile>=1.0
 pyyaml>=6.0
 pillow>=10.0

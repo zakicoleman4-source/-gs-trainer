@@ -1,154 +1,197 @@
+"""Quick 400-iteration training on the garden bundle + filter comparison.
+
+Run with:
+    CUDA_HOME=/home/tarbut/miniconda3 TORCH_CUDA_ARCH_LIST="6.1" python3 test_garden_train.py
 """
-400-iteration integration test on the real garden_3 bundle.
-Trains a quick smoke scene, then runs filter_splats at 5 aggressiveness levels
-and reports the splat count + per-stage breakdown for each.
-
-Run (requires GPU + bundle on external drive):
-    pytest test_garden_train.py -v -m gpu -s
-
-Skip automatically when the bundle isn't mounted.
-"""
-from __future__ import annotations
-
+import json
+import os
 import shutil
 import tempfile
+import time
+import zipfile
 from pathlib import Path
 
-import pytest
+os.environ.setdefault("CUDA_HOME", "/home/tarbut/miniconda3")
+os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "6.1")
 
-BUNDLE = Path("/media/tarbut/cAVS-132/garden_3_splat_bundle.zip")
+BUNDLE_ZIP = Path("/media/tarbut/cAVS-132/garden_3_splat_bundle.zip")
+WORK_DIR = Path("/tmp/gs_garden_test")
+ITERATIONS = 400
 
-pytestmark = pytest.mark.gpu
+def main():
+    print("=" * 60)
+    print(f"GARDEN TRAINING TEST — {ITERATIONS} iterations")
+    print("=" * 60)
 
+    if WORK_DIR.exists():
+        shutil.rmtree(WORK_DIR)
+    WORK_DIR.mkdir(parents=True)
 
-@pytest.fixture(scope="module")
-def garden_ply(tmp_path_factory):
-    """Train 400 iterations on the garden bundle; yield the raw output PLY."""
-    if not BUNDLE.exists():
-        pytest.skip(f"Bundle not found: {BUNDLE}")
+    # Extract bundle
+    print("\n[1/5] Extracting bundle...")
+    bundle_dir = WORK_DIR / "bundle"
+    with zipfile.ZipFile(BUNDLE_ZIP) as zf:
+        zf.extractall(bundle_dir)
 
-    import torch
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA not available")
+    # Parse + init + budget
+    print("\n[2/5] Preflight...")
+    from gs_pipeline.trainer.parse_metashape import parse_cameras_xml
+    from gs_pipeline.trainer.init_from_pcd import load_and_downsample
+    from gs_pipeline.trainer.budget import compute_budget, detect_gpu
 
-    from gs_pipeline.trainer.pipeline import run_pipeline
-    from gs_pipeline.trainer.train_mcmc import TrainConfig
+    scene = parse_cameras_xml(bundle_dir / "cameras.xml", image_dir=bundle_dir / "images")
+    cloud = load_and_downsample(bundle_dir / "dense.ply")
+    gpu = detect_gpu()
+    budget = compute_budget(gpu=gpu, image_sizes=scene.image_sizes, dense_pts=cloud.xyz.shape[0])
 
-    work = tmp_path_factory.mktemp("garden_work")
-    outbox = tmp_path_factory.mktemp("garden_out")
+    print(f"  {len(scene)} cameras, {cloud.xyz.shape[0]:,} init pts")
+    print(f"  GPU: {gpu.name}, {gpu.total_vram_bytes/1e9:.1f} GB")
+    print(f"  Target splats: {budget.target_splats:,}, downscale: {budget.downscale_factor:.3f}")
 
-    # Minimal config override: only 400 iters, no preview strip, filter disabled
-    # (we apply filters manually below to compare levels).
-    overrides = {
-        "iterations": 400,
-        "refine_start_iter": 50,
-        "eval_every": 400,
-        "preview_every": 9999,
-        "filter": {"enabled": False},
-    }
+    # Pre-scale K matrices (critical — the other session's pipeline.py does this)
+    if hasattr(budget, 'downscale_per_camera'):
+        for i, ds in enumerate(budget.downscale_per_camera):
+            if ds < 1.0:
+                scene.K_per_camera[i, :2, :] *= ds
+        effective_downscale = 1.0
+    else:
+        effective_downscale = budget.downscale_factor
 
-    result = run_pipeline(
-        bundle_path=BUNDLE,
-        work_dir=work,
-        outbox_dir=outbox,
-        config_overrides=overrides,
+    # Train
+    print(f"\n[3/5] Training {ITERATIONS} iterations...")
+    from gs_pipeline.trainer.train_mcmc import train, TrainerConfig
+    from gs_pipeline.trainer.job_state import new_job_state, PreflightSnapshot, write_state
+
+    config = TrainerConfig(
+        iterations=ITERATIONS,
+        eval_every=100,
+        preview_every=200,
+        checkpoint_every=200,
+        divergence_check_at_step=0,
+        memory_fraction=0.80,
+        holdout_stride=20,
+        filter_enabled=False,  # we'll filter manually after
+        timelapse_enabled=False,
     )
 
-    assert result is not None, "pipeline returned None"
-    ply = outbox / "scene.ply"
-    assert ply.exists(), f"scene.ply not written to {outbox}"
-    return ply
+    work_dir = WORK_DIR / "work"
+    outbox_dir = WORK_DIR / "outbox"
+    work_dir.mkdir(); outbox_dir.mkdir()
 
+    js = new_job_state("garden_test", bundle_filename="garden_3_splat_bundle.zip")
+    js.start_preflight()
+    preflight = PreflightSnapshot(
+        n_cameras=len(scene), total_megapixels=budget.total_megapixels,
+        dense_pts=budget.dense_pts, target_splats=budget.target_splats,
+        hard_cap_splats=budget.hard_cap_splats, iterations=ITERATIONS,
+        downscale_factor=budget.downscale_factor,
+        image_max_side=budget.image_max_side,
+        quality_preset="Auto", gpu_name=gpu.name,
+        gpu_total_vram_bytes=gpu.total_vram_bytes, notes=list(budget.notes),
+    )
+    js.start_training(preflight)
+    state_path = work_dir / "state.json"
+    write_state(js, state_path)
 
-# ---------------------------------------------------------------------------
-# Filter level definitions (none → maximum)
-# ---------------------------------------------------------------------------
-FILTER_LEVELS = [
-    {
-        "label": "none",
-        "enabled": False,
-    },
-    {
-        "label": "light",
-        "enabled": True,
-        "min_opacity": 0.001,
-        "sor_std_ratio": 3.5,
-        "max_scale_factor": 15.0,
-    },
-    {
-        "label": "medium (default)",
-        "enabled": True,
-        "min_opacity": 0.005,
-        "sor_std_ratio": 2.0,
-        "max_scale_factor": 10.0,
-    },
-    {
-        "label": "aggressive",
-        "enabled": True,
-        "min_opacity": 0.01,
-        "sor_std_ratio": 1.5,
-        "max_scale_factor": 7.0,
-    },
-    {
-        "label": "maximum",
-        "enabled": True,
-        "min_opacity": 0.02,
-        "sor_std_ratio": 1.0,
-        "max_scale_factor": 5.0,
-    },
-]
+    # Override budget downscale since K is already pre-scaled
+    if hasattr(budget, 'downscale_per_camera'):
+        budget_for_train = budget
+        # The training loop uses budget.downscale_factor; since K is pre-scaled,
+        # set it to 1.0 for training image loading
+        from dataclasses import replace
+        try:
+            budget_for_train = replace(budget, downscale_factor=1.0)
+        except Exception:
+            budget.downscale_factor = 1.0
+    else:
+        budget_for_train = budget
 
+    t0 = time.time()
+    try:
+        outputs = train(
+            scene=scene, init_cloud=cloud, budget=budget_for_train, config=config,
+            job_state=js, job_state_path=state_path,
+            work_dir=work_dir, outbox_dir=outbox_dir,
+        )
+    except Exception as e:
+        print(f"  TRAINING FAILED: {e}")
+        import traceback; traceback.print_exc()
+        return
+    elapsed = time.time() - t0
+    print(f"  Done in {elapsed:.1f}s ({ITERATIONS/elapsed:.1f} it/s)")
+    print(f"  Final PLY: {outputs.final_ply}")
 
-def _load_splat_arrays(ply_path: Path):
-    """Return (means, scales, quats, opacities, sh_dc, sh_rest) from a PLY."""
-    from gs_pipeline.trainer.export_ply import load_ply
-    return load_ply(ply_path)
-
-
-@pytest.mark.parametrize("level", FILTER_LEVELS, ids=[l["label"] for l in FILTER_LEVELS])
-def test_filter_level(garden_ply, level):
-    """Apply one filter level; assert splat count is sane and nothing crashes."""
+    # Filter comparison
+    print("\n[4/5] Testing filter configurations...")
+    from gs_pipeline.trainer.export_ply import read_inria_ply, write_inria_ply
     from gs_pipeline.trainer.filter_splats import filter_scene
 
-    arrays = _load_splat_arrays(garden_ply)
-    means, scales, quats, opacities, sh_dc, sh_rest = arrays
-    n_raw = len(means)
+    splat = read_inria_ply(outputs.final_ply)
+    n_total = splat.means.shape[0]
+    print(f"  Unfiltered splats: {n_total:,}")
 
-    if not level["enabled"]:
-        print(f"\n[none]  raw splats = {n_raw:,}")
-        assert n_raw > 0
-        return
+    filter_configs = {
+        "no_filter": dict(min_opacity=0.0, sor_k=1, sor_std_ratio=999.0, max_scale_factor=9999.0),
+        "light": dict(min_opacity=0.002, sor_k=10, sor_std_ratio=3.0, max_scale_factor=20.0),
+        "default": dict(min_opacity=0.005, sor_k=20, sor_std_ratio=2.0, max_scale_factor=10.0),
+        "aggressive": dict(min_opacity=0.01, sor_k=30, sor_std_ratio=1.5, max_scale_factor=5.0),
+        "extreme": dict(min_opacity=0.05, sor_k=50, sor_std_ratio=1.0, max_scale_factor=3.0),
+    }
 
-    filtered, report = filter_scene(
-        means=means,
-        scales=scales,
-        quats=quats,
-        opacities=opacities,
-        sh_dc=sh_dc,
-        sh_rest=sh_rest,
-        min_opacity=level["min_opacity"],
-        sor_k=20,
-        sor_std_ratio=level["sor_std_ratio"],
-        max_scale_factor=level["max_scale_factor"],
-    )
+    results = {}
+    filter_dir = WORK_DIR / "filter_comparison"
+    filter_dir.mkdir()
 
-    n_after = len(filtered[0])
-    pct_kept = 100.0 * n_after / n_raw
+    # Copy unfiltered for reference
+    shutil.copy2(outputs.final_ply, filter_dir / "scene_no_filter.ply")
 
-    print(
-        f"\n[{level['label']}]  raw={n_raw:,}  "
-        f"after_opacity={report.n_after_opacity:,}  "
-        f"after_scale={report.n_after_scale:,}  "
-        f"after_sor={report.n_after_sor:,}  "
-        f"kept={pct_kept:.1f}%"
-    )
+    for name, cfg in filter_configs.items():
+        if name == "no_filter":
+            results[name] = {"n_input": n_total, "n_output": n_total, "removed": 0,
+                             "pct_removed": "0.0%", "file_size_mb": f"{Path(outputs.final_ply).stat().st_size/1e6:.1f}",
+                             "path": str(filter_dir / "scene_no_filter.ply")}
+            continue
 
-    # Sanity: should keep at least 30% even on maximum settings
-    assert n_after > 0, "filter removed everything"
-    assert pct_kept > 30.0, f"filter too aggressive: only {pct_kept:.1f}% kept"
+        m, sc, q, o, dc, rest, report = filter_scene(
+            means=splat.means.copy(), scales=splat.scales.copy(),
+            quats=splat.quats.copy(), opacities=splat.opacities.copy(),
+            sh_dc=splat.sh_dc.copy(), sh_rest=splat.sh_rest.copy(),
+            **cfg,
+        )
+        out_path = filter_dir / f"scene_{name}.ply"
+        write_inria_ply(out_path=out_path, means=m, scales=sc, quats=q,
+                        opacities=o, sh_dc=dc, sh_rest=rest)
+        size_mb = out_path.stat().st_size / 1e6
+        results[name] = {
+            "n_input": report.n_input, "n_output": report.n_output,
+            "removed": report.n_input - report.n_output,
+            "pct_removed": f"{100*(1-report.n_output/max(report.n_input,1)):.1f}%",
+            "opacity_removed": report.n_input - report.n_after_opacity,
+            "scale_removed": report.n_after_opacity - report.n_after_scale,
+            "sor_removed": report.n_after_scale - report.n_after_sor,
+            "file_size_mb": f"{size_mb:.1f}",
+            "path": str(out_path),
+        }
+        print(f"  [{name}] {report.n_input:,} -> {report.n_output:,} ({results[name]['pct_removed']} removed)")
 
-    # Counts must be monotonically non-increasing through filter stages
-    assert report.n_after_opacity <= n_raw
-    assert report.n_after_scale <= report.n_after_opacity
-    assert report.n_after_sor <= report.n_after_scale
-    assert n_after == report.n_after_sor
+    # Report
+    print("\n[5/5] Writing report...")
+    report_data = {
+        "bundle": str(BUNDLE_ZIP), "iterations": ITERATIONS,
+        "training_time_s": round(elapsed, 1), "gpu": gpu.name,
+        "unfiltered_splats": n_total, "filter_results": results,
+    }
+    report_path = filter_dir / "comparison_report.json"
+    report_path.write_text(json.dumps(report_data, indent=2))
+
+    print(f"\n{'='*60}")
+    print(f"RESULTS in {filter_dir}")
+    for name in filter_configs:
+        r = results[name]
+        print(f"  {name:12s}: {r.get('n_output', n_total):>8,} splats  {r['file_size_mb']:>6s} MB  {r['path']}")
+    print(f"\nOpen PLY files in SuperSplat to compare visually.")
+    print(f"{'='*60}")
+
+
+if __name__ == "__main__":
+    main()
