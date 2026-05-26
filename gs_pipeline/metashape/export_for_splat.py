@@ -227,7 +227,7 @@ def zip_bundle(bundle_dir: Path, out_zip: Path) -> Path:
 def _call_export_cameras(chunk: Any, out_path: Path, *, metashape_module: Any) -> None:
     """Wrap Metashape's exportCameras API, tolerating its evolving signature."""
     # Metashape 1.8+: chunk.exportCameras(path, format=...) ; 2.x identical.
-    fn = getattr(chunk, "exportCameras", None)
+    fn = getattr(chunk, "exportCameras", None) or getattr(chunk, "exportReference", None)
     if fn is None:
         raise AttributeError("chunk has no exportCameras method")
     try:
@@ -242,15 +242,12 @@ def _call_export_cameras(chunk: Any, out_path: Path, *, metashape_module: Any) -
 
 
 def _call_export_points(chunk: Any, out_path: Path, *, metashape_module: Any) -> None:
-    """Wrap Metashape's exportPoints, asking for the dense cloud by default."""
-    fn = getattr(chunk, "exportPoints", None)
+    """Wrap Metashape's point-cloud export (1.x: exportPoints, 2.x: exportPointCloud)."""
+    fn = getattr(chunk, "exportPointCloud", None) or getattr(chunk, "exportPoints", None)
     if fn is None:
-        raise AttributeError("chunk has no exportPoints method")
+        raise AttributeError("chunk has no exportPointCloud or exportPoints method")
     source = None
     if metashape_module is not None:
-        # Newer Metashape uses .DataSource.DenseCloudData; older uses
-        # .DenseCloudData top-level.
-        # Metashape 2.x: DataSource.PointCloudData (was DenseCloudData)
         for path in ("DataSource.PointCloudData", "DataSource.DenseCloudData",
                       "PointCloudData", "DenseCloudData"):
             obj = metashape_module
@@ -267,7 +264,6 @@ def _call_export_points(chunk: Any, out_path: Path, *, metashape_module: Any) ->
         else:
             fn(str(out_path))
     except TypeError:
-        # Fallback to positional / minimal args.
         fn(str(out_path))
 
 
