@@ -41,9 +41,13 @@ regularization:
   opacity_reg: 0.005             # halved from 0.01 — less suppression = sharper detail
   scale_reg: 0.005               # halved from 0.01 — allow tighter splat fitting
   depth_reg_weight: 0.001        # edge-aware depth smoothness; 0 to disable
+  multiscale_loss_weight: 0.5    # 0.5× downsampled L1 alongside full-res; 0 = off
 
 rasterizer:
   antialias: true                # rasterize_mode="antialiased" — Mip-Splatting quality
+  prog_res_enabled: true         # coarse-to-fine resolution schedule
+  prog_res_warmup_fraction: 0.15 # first 15% of iters at 0.25× res (fast densification)
+  prog_res_mid_fraction: 0.40    # next 25% of iters at 0.5× res; remaining 60% = full res
 
 means_lr:
   final_factor: 0.01             # means LR decays exponentially to init_lr * this
@@ -101,6 +105,9 @@ preview:
 appearance:
   enabled: false   # enable for drone footage with auto-exposure variation
   lr: 0.01         # learning rate for per-camera exposure scalars
+
+export:
+  splat_binary: true  # write scene.splat (32 bytes/splat) alongside scene.ply
 
 large_scene:
   threshold_cameras: 500          # scenes with >= this many cameras use block training

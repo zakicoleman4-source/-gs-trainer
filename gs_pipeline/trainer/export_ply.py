@@ -184,3 +184,67 @@ def read_inria_ply(path: Path) -> LoadedSplat:
         means=means, scales=scales, quats=quats, opacities=opacities,
         sh_dc=sh_dc, sh_rest=sh_rest, sh_degree=sh_degree,
     )
+
+
+_SPLAT_BINARY_DTYPE = np.dtype([
+    ("x",  "<f4"), ("y",  "<f4"), ("z",  "<f4"),
+    ("sx", "<f4"), ("sy", "<f4"), ("sz", "<f4"),
+    ("r",  "u1"),  ("g",  "u1"),  ("b",  "u1"),  ("a",  "u1"),
+    ("qw", "u1"),  ("qx", "u1"),  ("qy", "u1"),  ("qz", "u1"),
+])  # 32 bytes per splat — antimatter15 / SuperSplat binary format
+
+
+def write_splat_binary(
+    *,
+    out_path: Path,
+    means: np.ndarray,       # (N, 3) float
+    scales: np.ndarray,      # (N, 3) float (log-scale)
+    quats: np.ndarray,       # (N, 4) float (w, x, y, z; need not be normalised)
+    opacities: np.ndarray,   # (N,) float (logit)
+    sh_dc: np.ndarray,       # (N, 3) float
+) -> Path:
+    """Write a 32-byte-per-splat ``.splat`` binary (antimatter15 / SuperSplat format).
+
+    Smaller (2-3×) than PLY; loads directly in web viewers.  SH rest bands are
+    discarded — the file encodes DC colour only, which is what the compact format
+    supports.
+    """
+    C0 = 0.28209479177387814
+    N = means.shape[0]
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    data = np.zeros(N, dtype=_SPLAT_BINARY_DTYPE)
+
+    data["x"] = means[:, 0].astype(np.float32)
+    data["y"] = means[:, 1].astype(np.float32)
+    data["z"] = means[:, 2].astype(np.float32)
+
+    # Actual scale (exp applied — viewers do NOT apply exp again).
+    data["sx"] = np.exp(scales[:, 0]).astype(np.float32)
+    data["sy"] = np.exp(scales[:, 1]).astype(np.float32)
+    data["sz"] = np.exp(scales[:, 2]).astype(np.float32)
+
+    # RGB from DC SH: C0 * sh_dc + 0.5 clamped to [0, 1] then to uint8.
+    rgb = np.clip(C0 * sh_dc.astype(np.float32) + 0.5, 0.0, 1.0)
+    data["r"] = (rgb[:, 0] * 255.0 + 0.5).astype(np.uint8)
+    data["g"] = (rgb[:, 1] * 255.0 + 0.5).astype(np.uint8)
+    data["b"] = (rgb[:, 2] * 255.0 + 0.5).astype(np.uint8)
+
+    # Alpha: sigmoid(logit) mapped to [0, 255].
+    logits = opacities.astype(np.float32).clip(-20.0, 20.0)
+    alpha_f = 1.0 / (1.0 + np.exp(-logits))
+    data["a"] = (alpha_f * 255.0 + 0.5).astype(np.uint8)
+
+    # Quaternion (w, x, y, z): normalise then map [-1, 1] → [0, 255].
+    q = quats.astype(np.float32)
+    norms = np.linalg.norm(q, axis=1, keepdims=True).clip(min=1e-8)
+    q /= norms
+    data["qw"] = np.clip(q[:, 0] * 128.0 + 128.0, 0.0, 255.0).astype(np.uint8)
+    data["qx"] = np.clip(q[:, 1] * 128.0 + 128.0, 0.0, 255.0).astype(np.uint8)
+    data["qy"] = np.clip(q[:, 2] * 128.0 + 128.0, 0.0, 255.0).astype(np.uint8)
+    data["qz"] = np.clip(q[:, 3] * 128.0 + 128.0, 0.0, 255.0).astype(np.uint8)
+
+    data.tofile(str(out_path))
+    _log.info("wrote %d splats to %s (%.1f MB)", N, out_path, out_path.stat().st_size / 1e6)
+    return out_path

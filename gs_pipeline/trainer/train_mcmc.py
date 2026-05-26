@@ -114,6 +114,11 @@ class TrainerConfig:
     antialias: bool = True               # rasterize_mode="antialiased" (Mip-Splatting)
     means_lr_final_factor: float = 0.01  # exponential decay: ends at init_lr * this
     depth_reg_weight: float = 0.001      # edge-aware depth smoothness; 0 to disable
+    multiscale_loss_weight: float = 0.5  # 0.5× downsampled L1 alongside full-res; 0 = off
+    prog_res_enabled: bool = True        # coarse-to-fine resolution schedule
+    prog_res_warmup_fraction: float = 0.15   # first N% of iters at 0.25× res
+    prog_res_mid_fraction: float = 0.40      # then N% of iters at 0.5× res; rest = full
+    export_splat_binary: bool = True     # write scene.splat alongside scene.ply
 
 
 def load_trainer_config(yaml_path: Path, *, iterations_override: Optional[int] = None) -> TrainerConfig:
@@ -142,6 +147,7 @@ def load_trainer_config(yaml_path: Path, *, iterations_override: Optional[int] =
     app_cfg = raw.get("appearance", {})
     rasterizer_cfg = raw.get("rasterizer", {})
     means_lr_cfg = raw.get("means_lr", {})
+    export_cfg = raw.get("export", {})
 
     return TrainerConfig(
         iterations=iterations,
@@ -180,6 +186,11 @@ def load_trainer_config(yaml_path: Path, *, iterations_override: Optional[int] =
         antialias=bool(rasterizer_cfg.get("antialias", True)),
         means_lr_final_factor=float(means_lr_cfg.get("final_factor", 0.01)),
         depth_reg_weight=float(reg.get("depth_reg_weight", 0.001)),
+        multiscale_loss_weight=float(reg.get("multiscale_loss_weight", 0.5)),
+        prog_res_enabled=bool(rasterizer_cfg.get("prog_res_enabled", True)),
+        prog_res_warmup_fraction=float(rasterizer_cfg.get("prog_res_warmup_fraction", 0.15)),
+        prog_res_mid_fraction=float(rasterizer_cfg.get("prog_res_mid_fraction", 0.40)),
+        export_splat_binary=bool(export_cfg.get("splat_binary", True)),
     )
 
 
@@ -339,6 +350,7 @@ def train(
     """
     # Heavy imports deferred so CPU CI never has to install them.
     import torch
+    import torch.nn.functional as F
     from gsplat import rasterization
     from gsplat.strategy import MCMCStrategy
 
@@ -440,6 +452,30 @@ def train(
                       else budget.downscale_factor)
             valid = _load_valid_mask(mask_path, ds_cam, device)
 
+            # Progressive coarse-to-fine resolution: scale K and target image
+            # for early training, then ramp to full res.  K was already pre-scaled
+            # by pipeline.py; here we apply an additional step-dependent factor.
+            if config.prog_res_enabled:
+                _pds = _progressive_ds(step, config.iterations,
+                                       config.prog_res_warmup_fraction,
+                                       config.prog_res_mid_fraction)
+                if _pds < 1.0:
+                    _H = max(4, int(target_img.shape[0] * _pds))
+                    _W = max(4, int(target_img.shape[1] * _pds))
+                    K_r = K.clone(); K_r[:2, :] = K_r[:2, :] * _pds
+                    target_r = F.interpolate(
+                        target_img.permute(2, 0, 1).unsqueeze(0),
+                        size=(_H, _W), mode="bilinear", align_corners=False,
+                    ).squeeze(0).permute(1, 2, 0)
+                    valid_r = (F.interpolate(
+                        valid.permute(2, 0, 1).unsqueeze(0),
+                        size=(_H, _W), mode="nearest",
+                    ).squeeze(0).permute(1, 2, 0) if valid is not None else None)
+                else:
+                    K_r, target_r, valid_r = K, target_img, valid
+            else:
+                K_r, target_r, valid_r = K, target_img, valid
+
             bg = torch.rand(3, device=device) if config.random_bg_per_step else torch.zeros(3, device=device)
 
             # Compose SH = [dc, rest[:active_dim]]
@@ -457,14 +493,14 @@ def train(
             try:
                 colors, alphas, info = rasterization(
                     means=means,
-                    quats=torch.nn.functional.normalize(quats, dim=-1),
+                    quats=F.normalize(quats, dim=-1),
                     scales=torch.exp(scales),
                     opacities=torch.sigmoid(opacities),
                     colors=sh_active,
                     viewmats=w2c[None].to(device),
-                    Ks=K[None].to(device),
-                    width=target_img.shape[1],
-                    height=target_img.shape[0],
+                    Ks=K_r[None].to(device),
+                    width=target_r.shape[1],
+                    height=target_r.shape[0],
                     near_plane=near,
                     far_plane=far,
                     backgrounds=bg[None],
@@ -485,25 +521,35 @@ def train(
             else:
                 pred_for_loss = pred
 
-            if valid is not None:
-                # valid: (H,W,1) float32 tensor, 1=compute loss, 0=masked out.
+            if valid_r is not None:
+                # valid_r: (H,W,1) float32 tensor, 1=compute loss, 0=masked out.
                 # L1 on zeroed-masked pixels; SSIM computed on full image with mask
                 # applied per-pixel so the convolution window stays clean.
-                n_valid = valid.sum().clamp(min=1.0)
-                pred_m = pred_for_loss * valid
-                target_m = target_img * valid
+                n_valid = valid_r.sum().clamp(min=1.0)
+                pred_m = pred_for_loss * valid_r
+                target_m = target_r * valid_r
                 loss = (1.0 - config.ssim_lambda) * (pred_m - target_m).abs().sum() / n_valid
-                loss = loss + config.ssim_lambda * _ssim_loss(pred_for_loss, target_img, mask=valid)
+                loss = loss + config.ssim_lambda * _ssim_loss(pred_for_loss, target_r, mask=valid_r)
             else:
-                loss = (1.0 - config.ssim_lambda) * (pred_for_loss - target_img).abs().mean()
-                loss = loss + config.ssim_lambda * _ssim_loss(pred_for_loss, target_img)
+                loss = (1.0 - config.ssim_lambda) * (pred_for_loss - target_r).abs().mean()
+                loss = loss + config.ssim_lambda * _ssim_loss(pred_for_loss, target_r)
+
+            # Multi-scale L1: 0.5× downsampled term captures coarse structure.
+            if config.multiscale_loss_weight > 0.0 and target_r.shape[0] >= 8 and target_r.shape[1] >= 8:
+                pred_half = F.avg_pool2d(
+                    pred_for_loss.permute(2, 0, 1).unsqueeze(0), 2, 2,
+                ).squeeze(0).permute(1, 2, 0)
+                gt_half = F.avg_pool2d(
+                    target_r.permute(2, 0, 1).unsqueeze(0), 2, 2,
+                ).squeeze(0).permute(1, 2, 0)
+                loss = loss + config.multiscale_loss_weight * (pred_half - gt_half).abs().mean()
 
             # Regularization (gsplat MCMC-style anti-floater terms).
             loss = loss + config.opacity_reg * torch.sigmoid(opacities).mean()
             loss = loss + config.scale_reg * torch.exp(scales).mean()
             if config.depth_reg_weight > 0.0:
                 depth_norm = depth / max(float(init_cloud.scene_extent), 1e-6)
-                loss = loss + config.depth_reg_weight * _depth_smooth_loss(depth_norm, target_img)
+                loss = loss + config.depth_reg_weight * _depth_smooth_loss(depth_norm, target_r)
 
             optimizer.zero_grad(set_to_none=True)
 
@@ -670,6 +716,24 @@ def train(
                 "n_output": f_report.n_output,
                 "summary": f_report.summary,
             }
+            _final_np = (f_means, f_scales, f_quats, f_opacities, f_sh_dc)
+        else:
+            _final_np = (
+                means.detach().cpu().numpy(),
+                scales.detach().cpu().numpy(),
+                quats.detach().cpu().numpy(),
+                opacities.detach().cpu().numpy(),
+                sh_dc.detach().cpu().numpy(),
+            )
+
+        # Compact .splat binary — 32 bytes/splat, web-compatible with SuperSplat.
+        if config.export_splat_binary:
+            from gs_pipeline.trainer.export_ply import write_splat_binary  # local import
+            write_splat_binary(
+                out_path=outbox_dir / "scene.splat",
+                means=_final_np[0], scales=_final_np[1], quats=_final_np[2],
+                opacities=_final_np[3], sh_dc=_final_np[4],
+            )
 
         report = {
             "job_id": job_state.job_id,
@@ -820,6 +884,22 @@ def _depth_smooth_loss(depth, image):
         (torch.exp(-img_dx * 10.0) * depth_dx).mean()
         + (torch.exp(-img_dy * 10.0) * depth_dy).mean()
     )
+
+
+def _progressive_ds(step: int, total_steps: int, warmup_frac: float, mid_frac: float) -> float:
+    """Coarse-to-fine resolution factor.
+
+    Returns 0.25 for the first ``warmup_frac`` of training, 0.5 for the next
+    ``mid_frac - warmup_frac`` portion, and 1.0 for the remainder.  Rendering
+    at reduced resolution during early training speeds up densification and
+    avoids fitting high-frequency noise before coarse structure is established.
+    """
+    frac = step / max(total_steps, 1)
+    if frac < warmup_frac:
+        return 0.25
+    if frac < mid_frac:
+        return 0.5
+    return 1.0
 
 
 def _means_lr_at_step(step, total_steps, lr_init, final_factor):
