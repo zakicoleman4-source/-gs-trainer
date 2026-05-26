@@ -23,7 +23,6 @@ name: docker
 
 on:
   push:
-    branches: ["main"]
     tags: ["v*"]
   workflow_dispatch:
     inputs:
