@@ -48,25 +48,14 @@ def _phase_upload() -> None:
         "Drag your Metashape export bundle (a `*_splat_bundle.zip`) into "
         "the area below. The trainer auto-tunes for your scene and GPU."
     )
-    col_q, col_t = st.columns(2)
-    with col_q:
-        quality = st.selectbox(
-            "Quality preset",
-            options=["Auto", "Maximum"],
-            index=0,
-            help="`Auto` = 40k iterations, balanced quality/time. "
-                 "`Maximum` = 100k iterations, slightly more splats per scene.",
-        )
-    with col_t:
-        trainer_label = st.selectbox(
-            "Trainer backend",
-            options=["MCMC (gsplat)", "Scaffold-GS (+1 dB quality)"],
-            index=0,
-            help="`MCMC` = gsplat MCMC densification, fast and proven. "
-                 "`Scaffold-GS` = anchor-based neural Gaussians, ~+1 dB PSNR, ~2x slower.",
-        )
+    quality = st.selectbox(
+        "Quality preset",
+        options=["Auto", "Maximum"],
+        index=0,
+        help="`Auto` = 40k iterations, balanced quality/time. "
+             "`Maximum` = 100k iterations, more splats and training time.",
+    )
     st.session_state["quality_preset"] = quality
-    st.session_state["trainer_backend"] = "scaffold" if "Scaffold" in trainer_label else "mcmc"
 
     file = st.file_uploader(
         "Drop your bundle .zip here",
@@ -124,13 +113,6 @@ def _phase_preflight() -> None:
             f"**{rows} x {cols} grid** ({report.n_blocks} blocks, "
             f"~{report.n_cameras // report.n_blocks} cameras per block). "
             f"Each block trains independently and results are merged into one PLY."
-        )
-    backend = st.session_state.get("trainer_backend", "mcmc")
-    if backend == "scaffold":
-        st.info(
-            "**Scaffold-GS** selected — anchor-based neural Gaussians, ~+1 dB PSNR "
-            "over MCMC. Training takes ~2x longer. Final PLY is baked from a "
-            "canonical viewpoint for SuperSplat/Polycam compatibility."
         )
     for w in report.warnings:
         st.warning(w)
