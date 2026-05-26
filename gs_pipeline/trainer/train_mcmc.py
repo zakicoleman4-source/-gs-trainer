@@ -589,18 +589,24 @@ def train(
             for opt in optimizers.values():
                 opt.zero_grad(set_to_none=True)
 
+            params = _strategy_params(means, scales, quats, opacities, sh_dc, sh_rest)
             strategy.step_pre_backward(
-                params=_strategy_params(means, scales, quats, opacities, sh_dc, sh_rest),
-                optimizers=optimizers, state=strategy_state, step=step, info=info,
+                params=params, optimizers=optimizers, state=strategy_state, step=step, info=info,
             )
             loss.backward()
             for opt in optimizers.values():
                 opt.step()
             strategy.step_post_backward(
-                params=_strategy_params(means, scales, quats, opacities, sh_dc, sh_rest),
-                optimizers=optimizers, state=strategy_state, step=step, info=info,
+                params=params, optimizers=optimizers, state=strategy_state, step=step, info=info,
                 lr=lr_means,
             )
+            # MCMCStrategy may grow/relocate Gaussians, replacing params in-place.
+            means = params["means"]
+            scales = params["scales"]
+            quats = params["quats"]
+            opacities = params["opacities"]
+            sh_dc = params["sh_dc"]
+            sh_rest = params["sh_rest"]
 
             if app_optimizer is not None:
                 app_optimizer.step()
