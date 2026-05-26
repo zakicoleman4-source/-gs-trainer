@@ -203,7 +203,12 @@ def _preflight(
     if not images_dir.is_dir():
         raise FileNotFoundError(f"missing images/ in bundle {bundle_dir}")
 
-    scene = parse_cameras_xml(cameras_xml, image_dir=images_dir)
+    masks_dir = bundle_dir / "masks"
+    scene = parse_cameras_xml(
+        cameras_xml,
+        image_dir=images_dir,
+        masks_dir=masks_dir if masks_dir.is_dir() else None,
+    )
     if not scene.image_paths or len(scene.image_paths) != len(scene):
         raise ValueError(
             f"{len(scene)} aligned cameras but only {len(scene.image_paths)} "

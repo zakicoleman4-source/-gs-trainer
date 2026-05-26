@@ -103,6 +103,8 @@ class ParsedScene:
     w2c_per_camera: np.ndarray          # shape (N, 4, 4)
     chunk_transform: Optional[np.ndarray]  # 4x4 c2w in world, None if identity
     image_paths: list[Path]             # resolved against image_dir (may be empty if image_dir is None)
+    # Parallel to image_labels; None for cameras that have no mask file.
+    mask_paths: list           # list[Optional[Path]]
     warnings: list[str] = field(default_factory=list)
 
     def __len__(self) -> int:
@@ -181,6 +183,7 @@ def _is_identity(M: np.ndarray) -> bool:
 def parse_cameras_xml(
     xml_path: Path,
     image_dir: Optional[Path] = None,
+    masks_dir: Optional[Path] = None,
 ) -> ParsedScene:
     """Parse a Metashape ``cameras.xml`` into a ParsedScene.
 
@@ -189,6 +192,10 @@ def parse_cameras_xml(
         image_dir: optional directory containing the photo files. If given,
             ``ParsedScene.image_paths`` will be filled with resolved paths and
             a warning is recorded for any label that cannot be found.
+        masks_dir: optional directory containing per-camera mask PNGs exported
+            by ``export_for_splat.py``. If given, ``ParsedScene.mask_paths``
+            is a list parallel to ``image_labels`` with ``None`` for cameras
+            that have no mask.
 
     Raises:
         FileNotFoundError: if ``xml_path`` does not exist.
@@ -235,6 +242,7 @@ def parse_cameras_xml(
     Ks: list[np.ndarray] = []
     w2cs: list[np.ndarray] = []
     image_paths: list[Path] = []
+    mask_paths: list = []  # Optional[Path] per camera
 
     for cam_el in cameras_el.iter("camera"):
         if cam_el.attrib.get("enabled", "true").lower() == "false":
@@ -285,6 +293,9 @@ def parse_cameras_xml(
             if resolved is not None:
                 image_paths.append(resolved)
 
+        if masks_dir is not None:
+            mask_paths.append(_resolve_mask(masks_dir, label))
+
     if not image_labels:
         raise ValueError("cameras.xml: no aligned cameras found")
 
@@ -299,6 +310,7 @@ def parse_cameras_xml(
         w2c_per_camera=w2c_arr,
         chunk_transform=chunk_transform,
         image_paths=image_paths,
+        mask_paths=mask_paths,
         warnings=warnings,
     )
 
@@ -389,6 +401,22 @@ def _parse_sensors(chunk: ET.Element, warnings: list[str]) -> dict[int, SensorCa
             f=f, cx=cx, cy=cy, b1=b1, b2=b2, k=k, p=p,
         )
     return sensors
+
+
+def _resolve_mask(masks_dir: Path, label: str) -> Optional[Path]:
+    """Return the mask PNG for ``label`` under ``masks_dir``, or None.
+
+    Only looks for PNG (the format _export_masks writes). No warning on miss —
+    it is normal for some cameras to lack masks.
+    """
+    stem = Path(label).stem
+    candidate = masks_dir / f"{stem}.png"
+    if candidate.is_file():
+        return candidate
+    candidate_upper = masks_dir / f"{stem}.PNG"
+    if candidate_upper.is_file():
+        return candidate_upper
+    return None
 
 
 def _resolve_image(image_dir: Path, label: str, warnings: list[str]) -> Optional[Path]:

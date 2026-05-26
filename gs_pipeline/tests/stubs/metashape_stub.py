@@ -36,11 +36,32 @@ class StubPhoto:
 
 
 @dataclass
+class StubMask:
+    """Minimal stand-in for Metashape.Mask; image() returns a solid-black PIL image."""
+    width: int = 128
+    height: int = 128
+
+    def image(self):
+        arr = np.zeros((self.height, self.width), dtype=np.uint8)
+        return _PilSaveWrapper(arr)
+
+
+class _PilSaveWrapper:
+    """Wraps a numpy array so ``.save(path)`` writes a PNG via PIL."""
+    def __init__(self, arr: np.ndarray) -> None:
+        self._arr = arr
+
+    def save(self, path: str) -> None:
+        Image.fromarray(self._arr, mode="L").save(path)
+
+
+@dataclass
 class StubCamera:
     label: str
     sensor: StubSensor
     photo: Optional[StubPhoto] = None
     transform: Optional[np.ndarray] = None  # 4x4 c2w; None = not aligned
+    mask: Optional[StubMask] = None
 
 
 @dataclass
@@ -121,6 +142,9 @@ class StubChunk:
                 continue
             arr = np.full((cam.sensor.height, cam.sensor.width, 3), 128, dtype=np.uint8)
             Image.fromarray(arr).save(d / cam.label)
+
+    def optimizeCameras(self, **kwargs) -> None:
+        """No-op in the stub; real optimization happens in Metashape."""
 
 
 # Top-level "module" attributes the exporter inspects.

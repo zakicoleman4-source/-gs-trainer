@@ -299,6 +299,8 @@ def train(
             cam_i = int(train_idx[rng.integers(0, len(train_idx))])
             K, w2c, image_path = _load_camera(scene, cam_i)
             target_img = _load_image_tensor(image_path, budget.downscale_factor, device)
+            mask_path = scene.mask_paths[cam_i] if scene.mask_paths else None
+            valid = _load_valid_mask(mask_path, budget.downscale_factor, device)
 
             bg = torch.rand(3, device=device) if config.random_bg_per_step else torch.zeros(3, device=device)
 
@@ -326,9 +328,19 @@ def train(
                 raise
 
             pred = colors[0]
-            loss = (1.0 - config.ssim_lambda) * (pred - target_img).abs().mean()
-            # SSIM term (skipped if scikit-image unavailable at import time):
-            loss = loss + config.ssim_lambda * _ssim_loss(pred, target_img)
+            if valid is not None:
+                # valid: (H,W,1) float32 tensor, 1=compute loss, 0=masked out.
+                # Zero masked pixels in both pred and target before loss so
+                # gradients are suppressed in excluded regions.
+                n_valid = valid.sum().clamp(min=1.0)
+                pred_m = pred * valid
+                target_m = target_img * valid
+                loss = (1.0 - config.ssim_lambda) * (pred_m - target_m).abs().sum() / n_valid
+                loss = loss + config.ssim_lambda * _ssim_loss(pred_m, target_m)
+            else:
+                loss = (1.0 - config.ssim_lambda) * (pred - target_img).abs().mean()
+                # SSIM term (skipped if scikit-image unavailable at import time):
+                loss = loss + config.ssim_lambda * _ssim_loss(pred, target_img)
 
             # Regularization (gsplat MCMC-style anti-floater terms).
             loss = loss + config.opacity_reg * torch.sigmoid(opacities).mean()
@@ -489,6 +501,33 @@ def _load_image_tensor(image_path: Path, downscale: float, device):
     import torch
     from gs_pipeline.trainer.render_eval import _load_image_np
     return torch.from_numpy(_load_image_np(image_path, downscale)).to(device)
+
+
+def _load_valid_mask(mask_path, downscale: float, device):
+    """Load a Metashape mask PNG as a (H, W, 1) validity tensor on ``device``.
+
+    Inverts Metashape's convention (white=excluded → 0, black=keep → 1) so the
+    result can be multiplied directly against pred/target in the loss.
+    Returns None if mask_path is None (no mask for this camera).
+    """
+    if mask_path is None:
+        return None
+    import torch
+    import numpy as np
+    try:
+        from PIL import Image
+        img = Image.open(mask_path).convert("L")
+        w, h = img.size
+        if downscale != 1.0:
+            nw = max(1, int(w / downscale))
+            nh = max(1, int(h / downscale))
+            img = img.resize((nw, nh), Image.NEAREST)
+        arr = np.array(img, dtype=np.float32) / 255.0
+        # Invert: Metashape white=excluded → we want 0=excluded, 1=valid.
+        valid = torch.from_numpy(1.0 - arr).unsqueeze(-1).to(device)  # (H, W, 1)
+        return valid
+    except Exception:
+        return None
 
 
 def _ssim_loss(pred, target):

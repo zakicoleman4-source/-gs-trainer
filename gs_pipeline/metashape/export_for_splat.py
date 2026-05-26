@@ -173,10 +173,9 @@ def export_chunk_to_bundle_dir(
     Steps:
       1. ``chunk.exportCameras(bundle_dir/cameras.xml, ...)``
       2. ``chunk.exportPoints(bundle_dir/dense.ply, source_data=DenseCloudData)``
-      3. Copy undistorted photos to ``bundle_dir/images/`` (uses
-         ``chunk.undistortPhotos`` if available; otherwise falls back to
-         ``camera.photo.path`` -> direct copy).
-      4. Write ``manifest.json``.
+      3. Copy undistorted photos to ``bundle_dir/images/``.
+      4. Export per-camera masks to ``bundle_dir/masks/`` (skipped if none exist).
+      5. Write ``manifest.json``.
 
     ``progress`` is a callback ``(message, fraction)`` so we can wire it to
     Metashape's progress dialog OR to a print loop in tests.
@@ -193,12 +192,15 @@ def export_chunk_to_bundle_dir(
     cameras_xml = bundle_dir / "cameras.xml"
     _call_export_cameras(chunk, cameras_xml, metashape_module=metashape_module)
 
-    progress("exporting dense cloud", 0.40)
+    progress("exporting dense cloud", 0.35)
     dense_ply = bundle_dir / "dense.ply"
     _call_export_points(chunk, dense_ply, metashape_module=metashape_module)
 
-    progress("exporting undistorted photos", 0.70)
+    progress("exporting undistorted photos", 0.60)
     _export_undistorted_photos(chunk, bundle_dir / "images", metashape_module=metashape_module)
+
+    progress("exporting masks", 0.80)
+    _export_masks(chunk, bundle_dir / "masks", metashape_module=metashape_module)
 
     progress("writing manifest", 0.95)
     manifest = _build_manifest(chunk, bundle_dir)
@@ -305,6 +307,47 @@ def _export_undistorted_photos(
             continue
 
 
+def _export_masks(
+    chunk: Any,
+    masks_dir: Path,
+    *,
+    metashape_module: Any = None,
+) -> int:
+    """Export per-camera masks from the chunk into ``masks_dir``.
+
+    Masks are saved as PNG files with the same stem as the camera label.
+    Follows Metashape convention: white pixels (255) = excluded region.
+    Returns the number of masks exported; removes the directory if none found.
+    """
+    masks_dir = Path(masks_dir)
+    masks_dir.mkdir(parents=True, exist_ok=True)
+    exported = 0
+    for camera in getattr(chunk, "cameras", []) or []:
+        if getattr(camera, "transform", None) is None:
+            continue
+        mask_obj = getattr(camera, "mask", None)
+        if mask_obj is None:
+            continue
+        label = getattr(camera, "label", None) or ""
+        stem = Path(label).stem if label else f"cam_{getattr(camera, 'key', exported)}"
+        dest = masks_dir / f"{stem}.png"
+        try:
+            img = getattr(mask_obj, "image", None)
+            if callable(img):
+                img = img()
+            if img is not None and hasattr(img, "save"):
+                img.save(str(dest))
+                exported += 1
+        except Exception:
+            continue
+    if exported == 0:
+        try:
+            masks_dir.rmdir()
+        except OSError:
+            pass
+    return exported
+
+
 def _camera_photo_path(camera: Any) -> Optional[str]:
     """Extract the source image path from a camera across Metashape versions."""
     photo = getattr(camera, "photo", None)
@@ -326,6 +369,8 @@ def _build_manifest(chunk: Any, bundle_dir: Path) -> dict:
     """Summarise the bundle for the trainer's preflight (and the UI)."""
     all_cams = getattr(chunk, "cameras", []) or []
     cameras = [c for c in all_cams if getattr(c, "transform", None) is not None]
+    masks_dir = bundle_dir / "masks"
+    n_masks = len(list(masks_dir.glob("*.png"))) if masks_dir.is_dir() else 0
     return {
         "format": BUNDLE_FORMAT,
         "source": "metashape_export",
@@ -333,6 +378,8 @@ def _build_manifest(chunk: Any, bundle_dir: Path) -> dict:
         "n_cameras": len(cameras),
         "image_size": _peek_image_size(chunk),
         "undistorted": True,
+        "has_masks": n_masks > 0,
+        "n_masks": n_masks,
         "files": [p.name for p in sorted(bundle_dir.iterdir()) if p.is_file()],
     }
 
@@ -388,6 +435,34 @@ def export_chunk_to_zip(
 
 
 # ---------------------------------------------------------------------------
+# Camera optimization (Metashape-coupled; called from main before export)
+# ---------------------------------------------------------------------------
+
+def _run_optimize_cameras(chunk: Any, *, metashape_module: Any) -> None:
+    """Run chunk.optimizeCameras() with a full parameter set.
+
+    Called automatically before every bundle export so the cameras.xml always
+    contains the best-fit calibration, not the raw alignment estimate.
+    Includes k4 for fisheye sensors.
+    """
+    has_fisheye = any(
+        str(getattr(s, "type", "")).split(".")[-1].lower() == "fisheye"
+        for s in (getattr(chunk, "sensors", []) or [])
+    )
+    chunk.optimizeCameras(
+        fit_f=True,
+        fit_cx=True,
+        fit_cy=True,
+        fit_k1=True,
+        fit_k2=True,
+        fit_k3=True,
+        fit_k4=has_fisheye,
+        fit_p1=True,
+        fit_p2=True,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Metashape GUI entry point
 # ---------------------------------------------------------------------------
 
@@ -426,6 +501,13 @@ def main() -> None:
                 progress_ctx.update(msg, frac)
         except Exception:
             pass
+
+    try:
+        _run_optimize_cameras(chunk, metashape_module=Metashape)
+    except Exception as exc:
+        Metashape.app.messageBox(
+            f"Warning: camera optimization failed and was skipped:\n{exc}"
+        )
 
     out_zip = psx_path.with_name(f"{psx_path.stem}_splat_bundle.zip")
     try:
