@@ -392,8 +392,13 @@ def main() -> None:
     for w in v.warnings:
         Metashape.app.messageBox(f"Warning: {w}")
 
-    progress_dialog = Metashape.app.progress  # callable returning a Progress object in 2.x
-    progress_ctx = progress_dialog("Exporting splat bundle") if callable(progress_dialog) else None
+    progress_dialog = getattr(Metashape.app, "progress", None)
+    progress_ctx = None
+    if callable(progress_dialog):
+        try:
+            progress_ctx = progress_dialog("Exporting splat bundle")
+        except Exception:
+            pass
 
     def report(msg: str, frac: float) -> None:
         try:
