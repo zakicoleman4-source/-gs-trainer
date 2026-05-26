@@ -206,6 +206,30 @@ def render_live_dashboard(
                 key="dl_timelapse",
             )
 
+    # Metrics CSV + Report JSON (available once training completes)
+    if js.state is State.DONE:
+        _dl_cols = st.columns(2)
+        metrics_p = getattr(js.outputs, "metrics_csv", None)
+        if metrics_p and Path(metrics_p).is_file():
+            with _dl_cols[0].empty():
+                _dl_cols[0].download_button(
+                    "Download metrics.csv",
+                    data=Path(metrics_p).read_bytes(),
+                    file_name="metrics.csv",
+                    mime="text/csv",
+                    key="dl_metrics",
+                )
+        rpt_p = getattr(js.outputs, "report_json", None)
+        if rpt_p and Path(rpt_p).is_file():
+            with _dl_cols[1].empty():
+                _dl_cols[1].download_button(
+                    "Download report.json",
+                    data=Path(rpt_p).read_bytes(),
+                    file_name="report.json",
+                    mime="application/json",
+                    key="dl_report",
+                )
+
     if js.state is State.DONE:
         # ── Result metrics card ───────────────────────────────────────────
         final_psnr = getattr(js.outputs, "final_psnr", None)

@@ -159,6 +159,13 @@ def run_job(
         js.start_training(preflight)
         write_state(js, state_path)
 
+        # Auto-enable appearance conditioning if images show significant
+        # brightness variation (drone footage with auto-exposure).
+        _appearance_note = _detect_auto_exposure(scene.image_paths)
+        if _appearance_note:
+            preflight.notes.append(_appearance_note)
+            write_state(js, state_path)
+
         # Resolve trainer backend: explicit parameter > config.yaml > default
         _backend = trainer_backend
         if _backend == "mcmc" and config_yaml is not None:
@@ -178,12 +185,17 @@ def run_job(
             _log.info("Trainer backend: scaffold (%d anchors budget)", budget.target_splats // _cfg.n_offsets)
         else:
             from gs_pipeline.trainer.train_mcmc import load_trainer_config, auto_adjust_config_for_scene
+            from dataclasses import replace as _dc_replace
             if config_yaml is not None:
                 _cfg = load_trainer_config(config_yaml)
                 _cfg = auto_adjust_config_for_scene(_cfg, n_cameras=len(scene))
             else:
                 from gs_pipeline.trainer.train_mcmc import TrainerConfig
                 _cfg = auto_adjust_config_for_scene(TrainerConfig(), n_cameras=len(scene))
+            # Auto-enable appearance conditioning when exposure variation detected.
+            if _appearance_note and not _cfg.appearance_enabled:
+                _cfg = _dc_replace(_cfg, appearance_enabled=True)
+                _log.info("appearance conditioning auto-enabled (exposure variation detected)")
 
         # Large-scene routing: when no custom train_fn is injected and the scene has
         # >= 500 cameras, partition into spatial blocks and train each independently.
@@ -336,6 +348,46 @@ def _preflight(
         )
 
     return scene, init_cloud, budget
+
+
+def _detect_auto_exposure(image_paths: list, *, sample_n: int = 12) -> str:
+    """Return a note string if the scene shows significant exposure variation.
+
+    Samples up to ``sample_n`` images, computes each image's mean brightness
+    (grayscale).  If the std-dev across means exceeds 0.12 (12% of [0,1])
+    the scene likely has auto-exposure variation — appearance conditioning helps.
+    Returns an empty string when no significant variation is detected.
+    """
+    if not image_paths:
+        return ""
+    try:
+        import random
+        from PIL import Image
+        import numpy as np
+
+        rng = random.Random(42)
+        sample = rng.sample(list(image_paths), min(sample_n, len(image_paths)))
+        means: list[float] = []
+        for p in sample:
+            try:
+                img = Image.open(p).convert("L")
+                # Thumbnail for speed — we only need brightness, not full res.
+                img.thumbnail((128, 128))
+                means.append(float(np.asarray(img, dtype=np.float32).mean()) / 255.0)
+            except Exception:
+                continue
+        if len(means) < 3:
+            return ""
+        std = float(np.std(means))
+        if std > 0.12:
+            return (
+                f"Significant brightness variation detected across cameras "
+                f"(std={std:.3f}). Per-camera exposure compensation has been "
+                f"automatically enabled to compensate for auto-exposure."
+            )
+    except Exception:
+        pass
+    return ""
 
 
 def _preflight_snapshot(budget: Budget) -> PreflightSnapshot:
