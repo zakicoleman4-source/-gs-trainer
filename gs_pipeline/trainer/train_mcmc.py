@@ -447,6 +447,8 @@ def train(
 
     # Timelapse: collect one preview strip frame per checkpoint for final MP4.
     _timelapse_frames: list[Path] = []
+    _oom_count = 0
+    _MAX_OOM_RECOVERIES = 5
 
     watchdog = ProgressWatchdog(timeout_s=config.watchdog_timeout_s, poll_interval_s=config.watchdog_poll_interval_s)
     watchdog.start()
@@ -532,39 +534,14 @@ def train(
                     rasterize_mode="antialiased" if config.antialias else "classic",
                 )
             except torch.cuda.OutOfMemoryError:
-                clear_cuda_cache()
-                # Emergency prune: kill the weakest 20% of splats by opacity
-                n_before = means.shape[0]
-                keep_n = max(int(n_before * 0.8), 1000)
-                opa_vals = torch.sigmoid(opacities.detach())
-                _, keep_idx = torch.topk(opa_vals, keep_n)
-                keep_idx = keep_idx.sort().values
-                means = means[keep_idx].detach().requires_grad_(True)
-                scales = scales[keep_idx].detach().requires_grad_(True)
-                quats = quats[keep_idx].detach().requires_grad_(True)
-                opacities = opacities[keep_idx].detach().requires_grad_(True)
-                sh_dc = sh_dc[keep_idx].detach().requires_grad_(True)
-                sh_rest = sh_rest[keep_idx].detach().requires_grad_(True)
-                # Reduce cap_max so MCMC doesn't grow back immediately
-                strategy.cap_max = keep_n
-                # Rebuild optimizers for pruned params
-                optimizers = {
-                    "means": torch.optim.Adam([means], lr=lr_means),
-                    "scales": torch.optim.Adam([scales], lr=0.005),
-                    "quats": torch.optim.Adam([quats], lr=0.001),
-                    "opacities": torch.optim.Adam([opacities], lr=0.05),
-                    "sh_dc": torch.optim.Adam([sh_dc], lr=0.0025),
-                    "sh_rest": torch.optim.Adam([sh_rest], lr=0.0025 / 20.0),
-                }
-                strategy_state = strategy.initialize_state()
-                clear_cuda_cache()
-                _log.warning(
-                    "OOM at step %d: emergency pruned %d -> %d splats (cap_max=%d). Continuing.",
-                    step, n_before, keep_n, keep_n,
-                )
-                job_state.tick(current_step=step, current_splats=keep_n, loss=float('nan'))
-                job_state.status_msg = f"Recovered from memory pressure at step {step} — pruned to {keep_n:,} splats"
-                write_state(job_state, job_state_path)
+                means, scales, quats, opacities, sh_dc, sh_rest, optimizers, strategy_state = \
+                    _oom_recovery(
+                        means, scales, quats, opacities, sh_dc, sh_rest,
+                        strategy=strategy, lr_means=lr_means, step=step,
+                        job_state=job_state, job_state_path=job_state_path,
+                        oom_count=_oom_count, device=device,
+                    )
+                _oom_count += 1
                 continue
 
             pred = colors[0, :, :, :3]    # (H, W, 3) RGB
@@ -621,22 +598,33 @@ def train(
             for opt in optimizers.values():
                 opt.zero_grad(set_to_none=True)
 
-            params = _strategy_params(means, scales, quats, opacities, sh_dc, sh_rest)
-            strategy.step_pre_backward(
-                params=params, optimizers=optimizers, state=strategy_state, step=step, info=info,
-            )
-            loss.backward()
-            for opt in optimizers.values():
-                opt.step()
-            strategy.step_post_backward(
-                params=params, optimizers=optimizers, state=strategy_state, step=step, info=info,
-                lr=lr_means,
-            )
-            # MCMCStrategy may grow/relocate Gaussians, replacing params in-place.
-            means = params["means"]
-            scales = params["scales"]
-            quats = params["quats"]
-            opacities = params["opacities"]
+            try:
+                params = _strategy_params(means, scales, quats, opacities, sh_dc, sh_rest)
+                strategy.step_pre_backward(
+                    params=params, optimizers=optimizers, state=strategy_state, step=step, info=info,
+                )
+                loss.backward()
+                for opt in optimizers.values():
+                    opt.step()
+                strategy.step_post_backward(
+                    params=params, optimizers=optimizers, state=strategy_state, step=step, info=info,
+                    lr=lr_means,
+                )
+                # MCMCStrategy may grow/relocate Gaussians, replacing params in-place.
+                means = params["means"]
+                scales = params["scales"]
+                quats = params["quats"]
+                opacities = params["opacities"]
+            except torch.cuda.OutOfMemoryError:
+                means, scales, quats, opacities, sh_dc, sh_rest, optimizers, strategy_state = \
+                    _oom_recovery(
+                        means, scales, quats, opacities, sh_dc, sh_rest,
+                        strategy=strategy, lr_means=lr_means, step=step,
+                        job_state=job_state, job_state_path=job_state_path,
+                        oom_count=_oom_count, device=device,
+                    )
+                _oom_count += 1
+                continue
             sh_dc = params["sh_dc"]
             sh_rest = params["sh_rest"]
 
@@ -925,6 +913,62 @@ def train(
 # ---------------------------------------------------------------------------
 # Small helpers (most are GPU-side; collected here for readability)
 # ---------------------------------------------------------------------------
+
+def _oom_recovery(
+    means, scales, quats, opacities, sh_dc, sh_rest,
+    *, strategy, lr_means, step, job_state, job_state_path, oom_count, device,
+):
+    """Emergency OOM recovery: prune weakest splats, rebuild optimizer, continue."""
+    import torch
+    from gs_pipeline.trainer.oom_guard import clear_cuda_cache
+
+    clear_cuda_cache()
+
+    n_before = means.shape[0]
+    if oom_count >= 5 or n_before < 10_000:
+        raise RuntimeError(
+            f"OOM recovery exhausted after {oom_count} attempts "
+            f"(only {n_before:,} splats remaining). GPU memory too small for this scene."
+        )
+
+    keep_n = max(int(n_before * 0.75), 10_000)
+    opa_vals = torch.sigmoid(opacities.detach())
+    _, keep_idx = torch.topk(opa_vals, min(keep_n, n_before))
+    keep_idx = keep_idx.sort().values
+
+    means = means[keep_idx].detach().requires_grad_(True)
+    scales = scales[keep_idx].detach().requires_grad_(True)
+    quats = quats[keep_idx].detach().requires_grad_(True)
+    opacities = opacities[keep_idx].detach().requires_grad_(True)
+    sh_dc = sh_dc[keep_idx].detach().requires_grad_(True)
+    sh_rest = sh_rest[keep_idx].detach().requires_grad_(True)
+
+    strategy.cap_max = keep_n
+
+    optimizers = {
+        "means": torch.optim.Adam([means], lr=lr_means),
+        "scales": torch.optim.Adam([scales], lr=0.005),
+        "quats": torch.optim.Adam([quats], lr=0.001),
+        "opacities": torch.optim.Adam([opacities], lr=0.05),
+        "sh_dc": torch.optim.Adam([sh_dc], lr=0.0025),
+        "sh_rest": torch.optim.Adam([sh_rest], lr=0.0025 / 20.0),
+    }
+    strategy_state = strategy.initialize_state()
+    clear_cuda_cache()
+
+    _log.warning(
+        "OOM recovery %d at step %d: pruned %d -> %d splats (cap_max=%d)",
+        oom_count + 1, step, n_before, keep_n, keep_n,
+    )
+    job_state.tick(current_step=step, current_splats=keep_n, loss=float('nan'))
+    job_state.status_msg = (
+        f"Recovered from memory pressure at step {step} "
+        f"(attempt {oom_count + 1}) — pruned to {keep_n:,} splats"
+    )
+    write_state(job_state, job_state_path)
+
+    return means, scales, quats, opacities, sh_dc, sh_rest, optimizers, strategy_state
+
 
 class _DivergenceAbort(RuntimeError):
     """Raised inside the training loop to abort on persistent low PSNR."""
