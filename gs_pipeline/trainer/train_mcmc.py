@@ -119,6 +119,7 @@ class TrainerConfig:
     prog_res_warmup_fraction: float = 0.15   # first N% of iters at 0.25× res
     prog_res_mid_fraction: float = 0.40      # then N% of iters at 0.5× res; rest = full
     export_splat_binary: bool = True     # write scene.splat alongside scene.ply
+    sh_freq_reg_weight: float = 0.01    # L2 on SH rest; linearly decays to 0 at 50% of iters
 
 
 def load_trainer_config(yaml_path: Path, *, iterations_override: Optional[int] = None) -> TrainerConfig:
@@ -191,6 +192,7 @@ def load_trainer_config(yaml_path: Path, *, iterations_override: Optional[int] =
         prog_res_warmup_fraction=float(rasterizer_cfg.get("prog_res_warmup_fraction", 0.15)),
         prog_res_mid_fraction=float(rasterizer_cfg.get("prog_res_mid_fraction", 0.40)),
         export_splat_binary=bool(export_cfg.get("splat_binary", True)),
+        sh_freq_reg_weight=float(reg.get("sh_freq_reg_weight", 0.01)),
     )
 
 
@@ -551,6 +553,15 @@ def train(
                 depth_norm = depth / max(float(init_cloud.scene_extent), 1e-6)
                 loss = loss + config.depth_reg_weight * _depth_smooth_loss(depth_norm, target_r)
 
+            # SH frequency regularization: decaying L2 on rest bands.
+            # Prevents high-frequency view-dependent noise from baking in before
+            # coarse structure is established.  Ramps linearly from full weight
+            # to zero at the midpoint (50%) of training.
+            if config.sh_freq_reg_weight > 0.0 and sh_rest.shape[1] > 0:
+                _sh_decay = max(0.0, 1.0 - step / max(config.iterations * 0.5, 1))
+                if _sh_decay > 0.0:
+                    loss = loss + config.sh_freq_reg_weight * _sh_decay * (sh_rest ** 2).mean()
+
             optimizer.zero_grad(set_to_none=True)
 
             strategy.step_pre_backward(
@@ -735,10 +746,16 @@ def train(
                 opacities=_final_np[3], sh_dc=_final_np[4],
             )
 
+        _final_psnr = job_state.progress.psnr_history[-1][1] if job_state.progress.psnr_history else None
+        _final_ssim = job_state.progress.ssim_history[-1][1] if job_state.progress.ssim_history else None
+        _final_count = int(_final_np[0].shape[0])
+
         report = {
             "job_id": job_state.job_id,
             "final_step": config.iterations,
-            "final_splat_count": int(means.shape[0]),
+            "final_splat_count": _final_count,
+            "final_psnr_db": _final_psnr,
+            "final_ssim": _final_ssim,
             "preflight": job_state.preflight.__dict__ if job_state.preflight else None,
             "filter": filter_report_dict if filter_report_dict else None,
         }
@@ -752,12 +769,20 @@ def train(
                 timelapse_path = str(tl_out)
                 _log.info("timelapse written: %s", tl_out)
 
+        _splat_path = outbox_dir / "scene.splat"
+        _unfiltered_path = outbox_dir / "scene_unfiltered.ply"
+
         strip_str = str(work_dir / "preview_strip.png")
         return OutputsSnapshot(
             checkpoints=job_state.outputs.checkpoints,
             preview_png=strip_str,
             preview_strip_png=strip_str,
             final_ply=str(final_ply),
+            final_splat=str(_splat_path) if _splat_path.is_file() else None,
+            final_ply_unfiltered=str(_unfiltered_path) if _unfiltered_path.is_file() else None,
+            final_psnr=_final_psnr,
+            final_ssim=_final_ssim,
+            final_splat_count=_final_count,
             metrics_csv=str(metrics_path),
             report_json=str(work_dir / "report.json"),
             timelapse_mp4=timelapse_path,

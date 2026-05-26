@@ -192,16 +192,68 @@ def render_live_dashboard(
                 key="dl_timelapse",
             )
 
-    if js.state is State.DONE and js.outputs.final_ply:
-        final = Path(js.outputs.final_ply)
-        if final.is_file():
-            st.success("Training complete — final splat is ready.")
-            with final.open("rb") as f:
-                st.download_button("Download final scene.ply",
-                                    data=f.read(),
-                                    file_name="scene.ply",
-                                    mime="application/octet-stream",
-                                    key="dl_final")
+    if js.state is State.DONE:
+        # ── Result metrics card ───────────────────────────────────────────
+        final_psnr = getattr(js.outputs, "final_psnr", None)
+        final_ssim = getattr(js.outputs, "final_ssim", None)
+        final_count = getattr(js.outputs, "final_splat_count", None)
+        if any(v is not None for v in (final_psnr, final_ssim, final_count)):
+            mc = st.columns(3)
+            if final_psnr is not None:
+                mc[0].metric("Final PSNR", f"{final_psnr:.2f} dB")
+            if final_ssim is not None:
+                mc[1].metric("Final SSIM", f"{final_ssim:.3f}")
+            if final_count is not None:
+                mc[2].metric("Splats (filtered)", f"{final_count / 1e6:.2f} M")
+
+        # ── Filter breakdown (from report.json) ───────────────────────────
+        report_json_path = getattr(js.outputs, "report_json", None)
+        if report_json_path and Path(report_json_path).is_file():
+            import json as _json
+            try:
+                _rpt = _json.loads(Path(report_json_path).read_text(encoding="utf-8"))
+                _filt = _rpt.get("filter")
+                if _filt and _filt.get("n_input"):
+                    n_in = _filt["n_input"]
+                    n_out = _filt["n_output"]
+                    pct = 100.0 * (1 - n_out / max(n_in, 1))
+                    with st.expander(f"Filter stats — {pct:.1f}% of floaters removed"):
+                        fc = st.columns(4)
+                        fc[0].metric("Before filter", f"{n_in / 1e6:.2f} M")
+                        fc[1].metric("Opacity pass", f"{_filt.get('n_after_opacity', n_out) / 1e6:.2f} M")
+                        fc[2].metric("Scale pass", f"{_filt.get('n_after_scale', n_out) / 1e6:.2f} M")
+                        fc[3].metric("After SOR", f"{n_out / 1e6:.2f} M")
+            except Exception:
+                pass
+
+        # ── Download buttons ──────────────────────────────────────────────
+        if js.outputs.final_ply and Path(js.outputs.final_ply).is_file():
+            st.success("Training complete — scene is ready.")
+            with Path(js.outputs.final_ply).open("rb") as f:
+                st.download_button(
+                    "Download scene.ply (full quality, SH degree 3)",
+                    data=f.read(), file_name="scene.ply",
+                    mime="application/octet-stream", key="dl_final",
+                )
+
+        final_splat_p = getattr(js.outputs, "final_splat", None)
+        if final_splat_p and Path(final_splat_p).is_file():
+            size_mb = Path(final_splat_p).stat().st_size / 1e6
+            with Path(final_splat_p).open("rb") as f:
+                st.download_button(
+                    f"Download scene.splat (web viewer, {size_mb:.0f} MB)",
+                    data=f.read(), file_name="scene.splat",
+                    mime="application/octet-stream", key="dl_splat",
+                )
+
+        final_unf = getattr(js.outputs, "final_ply_unfiltered", None)
+        if final_unf and Path(final_unf).is_file():
+            with Path(final_unf).open("rb") as f:
+                st.download_button(
+                    "Download scene_unfiltered.ply (pre-filter backup)",
+                    data=f.read(), file_name="scene_unfiltered.ply",
+                    mime="application/octet-stream", key="dl_unfiltered",
+                )
 
     # --- Notes / warnings -------------------------------------------------
     if js.preflight and js.preflight.notes:

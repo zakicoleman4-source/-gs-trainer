@@ -113,6 +113,11 @@ class OutputsSnapshot:
     preview_strip_png: Optional[str] = None   # path to latest 3-panel strip
     timelapse_mp4: Optional[str] = None       # path to training timelapse (written at end)
     final_ply: Optional[str] = None
+    final_splat: Optional[str] = None         # path to scene.splat (compact binary)
+    final_ply_unfiltered: Optional[str] = None  # pre-filter backup
+    final_psnr: Optional[float] = None        # last holdout PSNR (dB)
+    final_ssim: Optional[float] = None        # last holdout SSIM
+    final_splat_count: Optional[int] = None   # splat count after filter
     metrics_csv: Optional[str] = None
     report_json: Optional[str] = None
 

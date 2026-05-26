@@ -12,6 +12,7 @@ from gs_pipeline.trainer.export_ply import (
     num_sh_rest_coeffs,
     read_inria_ply,
     write_inria_ply,
+    write_splat_binary,
 )
 
 
@@ -174,6 +175,50 @@ def test_read_missing_required_property_raises(tmp_path: Path):
     PlyData([el], text=False).write(str(out))
     with pytest.raises(ValueError, match="missing properties"):
         read_inria_ply(out)
+
+
+# ---------------------------------------------------------------------------
+# write_splat_binary
+# ---------------------------------------------------------------------------
+
+def test_splat_binary_size_is_32_bytes_per_splat(tmp_path: Path):
+    n = 47
+    means, scales, quats, opacities, sh_dc, _ = _make_splat_arrays(n, 0)
+    out = tmp_path / "scene.splat"
+    write_splat_binary(out_path=out, means=means, scales=scales,
+                       quats=quats, opacities=opacities, sh_dc=sh_dc)
+    assert out.stat().st_size == n * 32
+
+
+def test_splat_binary_position_round_trips(tmp_path: Path):
+    """Positions written to .splat must be recoverable as float32."""
+    n = 10
+    means = np.array([[1.5, -2.3, 0.7]] * n, dtype=np.float32)
+    scales = np.zeros((n, 3), dtype=np.float32)
+    quats = np.tile([1.0, 0.0, 0.0, 0.0], (n, 1)).astype(np.float32)
+    opacities = np.zeros(n, dtype=np.float32)
+    sh_dc = np.zeros((n, 3), dtype=np.float32)
+    out = tmp_path / "scene.splat"
+    write_splat_binary(out_path=out, means=means, scales=scales,
+                       quats=quats, opacities=opacities, sh_dc=sh_dc)
+    raw = np.frombuffer(out.read_bytes(), dtype=np.float32).reshape(n, 8)
+    np.testing.assert_allclose(raw[:, :3], means, atol=1e-6)
+
+
+def test_splat_binary_opacity_maps_correctly(tmp_path: Path):
+    """sigmoid(0) ≈ 0.5 → alpha ≈ 127 or 128."""
+    n = 1
+    means = np.zeros((n, 3), dtype=np.float32)
+    scales = np.zeros((n, 3), dtype=np.float32)
+    quats = np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32)
+    opacities = np.zeros(n, dtype=np.float32)  # logit 0 → sigmoid = 0.5
+    sh_dc = np.zeros((n, 3), dtype=np.float32)
+    out = tmp_path / "scene.splat"
+    write_splat_binary(out_path=out, means=means, scales=scales,
+                       quats=quats, opacities=opacities, sh_dc=sh_dc)
+    raw = np.frombuffer(out.read_bytes(), dtype=np.uint8)
+    alpha = raw[27]  # 24+3 = offset of 'a' byte
+    assert 126 <= alpha <= 129  # 0.5 * 255 ≈ 127.5
 
 
 # ---------------------------------------------------------------------------
