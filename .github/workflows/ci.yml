@@ -19,5 +19,5 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r gs_pipeline/requirements-cpu.txt
-      - name: Run pytest (193 expected, 1 GPU-gated skip)
+      - name: Run pytest (CPU suite; GPU-gated tests skipped)
         run: pytest gs_pipeline -v
