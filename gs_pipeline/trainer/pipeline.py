@@ -231,6 +231,29 @@ def run_job(
                     )
                 break  # success
             except Exception as _train_exc:
+                # _NeedPartitioning: in-loop OOM recovery fired 2+ times,
+                # scene is too large for single-shot — switch to block training.
+                from gs_pipeline.trainer.train_mcmc import _NeedPartitioning
+                if isinstance(_train_exc, _NeedPartitioning):
+                    clear_cuda_cache()
+                    _log.warning(
+                        "Switching to block-partitioned training: %s", _train_exc,
+                    )
+                    js.status_msg = "Switching to block-partitioned training (scene too large for single-shot)"
+                    write_state(js, state_path)
+                    from gs_pipeline.trainer.large_scene import run_large_scene
+                    from dataclasses import replace as _replace2
+                    _reduced_budget = _replace2(budget,
+                        target_splats=max(500_000, budget.target_splats // 2),
+                        hard_cap_splats=max(500_000, budget.hard_cap_splats // 2),
+                    )
+                    _reduced_budget.notes.append("Auto-partitioned after repeated OOM in single-shot mode")
+                    outputs = run_large_scene(
+                        scene=scene, init_cloud=init_cloud, budget=_reduced_budget,
+                        config=_cfg, job_state=js, job_state_path=state_path,
+                        work_dir=work_dir, outbox_dir=outbox_dir,
+                    )
+                    break
                 if not is_cuda_oom(_train_exc) or _oom_attempt >= _max_oom_retries - 1:
                     raise  # not OOM or last attempt — propagate
                 clear_cuda_cache()
