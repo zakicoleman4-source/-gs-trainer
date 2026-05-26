@@ -114,6 +114,7 @@ class TrainerConfig:
     antialias: bool = True               # rasterize_mode="antialiased" (Mip-Splatting)
     means_lr_final_factor: float = 0.01  # exponential decay: ends at init_lr * this
     depth_reg_weight: float = 0.001      # edge-aware depth smoothness; 0 to disable
+    depth_lap_weight: float = 0.0002     # depth Laplacian (planar surface regulariser); 0 = off
     multiscale_loss_weight: float = 0.5  # 0.5× downsampled L1 alongside full-res; 0 = off
     prog_res_enabled: bool = True        # coarse-to-fine resolution schedule
     prog_res_warmup_fraction: float = 0.15   # first N% of iters at 0.25× res
@@ -187,6 +188,7 @@ def load_trainer_config(yaml_path: Path, *, iterations_override: Optional[int] =
         antialias=bool(rasterizer_cfg.get("antialias", True)),
         means_lr_final_factor=float(means_lr_cfg.get("final_factor", 0.01)),
         depth_reg_weight=float(reg.get("depth_reg_weight", 0.001)),
+        depth_lap_weight=float(reg.get("depth_lap_weight", 0.0002)),
         multiscale_loss_weight=float(reg.get("multiscale_loss_weight", 0.5)),
         prog_res_enabled=bool(rasterizer_cfg.get("prog_res_enabled", True)),
         prog_res_warmup_fraction=float(rasterizer_cfg.get("prog_res_warmup_fraction", 0.15)),
@@ -549,9 +551,12 @@ def train(
             # Regularization (gsplat MCMC-style anti-floater terms).
             loss = loss + config.opacity_reg * torch.sigmoid(opacities).mean()
             loss = loss + config.scale_reg * torch.exp(scales).mean()
-            if config.depth_reg_weight > 0.0:
+            if config.depth_reg_weight > 0.0 or config.depth_lap_weight > 0.0:
                 depth_norm = depth / max(float(init_cloud.scene_extent), 1e-6)
-                loss = loss + config.depth_reg_weight * _depth_smooth_loss(depth_norm, target_r)
+                if config.depth_reg_weight > 0.0:
+                    loss = loss + config.depth_reg_weight * _depth_smooth_loss(depth_norm, target_r)
+                if config.depth_lap_weight > 0.0 and depth_norm.shape[0] > 2 and depth_norm.shape[1] > 2:
+                    loss = loss + config.depth_lap_weight * _depth_laplacian_loss(depth_norm)
 
             # SH frequency regularization: decaying L2 on rest bands.
             # Prevents high-frequency view-dependent noise from baking in before
@@ -925,6 +930,19 @@ def _progressive_ds(step: int, total_steps: int, warmup_frac: float, mid_frac: f
     if frac < mid_frac:
         return 0.5
     return 1.0
+
+
+def _depth_laplacian_loss(depth):
+    """Second-order depth smoothness: penalises non-planar depth variation.
+
+    Computes the discrete Laplacian (d²D/dx² + d²D/dy²) and returns its
+    mean squared magnitude.  Planar surfaces → Laplacian ≈ 0.  This is
+    complementary to ``_depth_smooth_loss`` (first-order): together they
+    encourage piece-wise planar geometry.  Input: (H, W, 1) depth tensor.
+    """
+    lap_x = depth[2:, 1:-1, :] - 2.0 * depth[1:-1, 1:-1, :] + depth[:-2, 1:-1, :]
+    lap_y = depth[1:-1, 2:, :] - 2.0 * depth[1:-1, 1:-1, :] + depth[1:-1, :-2, :]
+    return (lap_x ** 2 + lap_y ** 2).mean()
 
 
 def _means_lr_at_step(step, total_steps, lr_init, final_factor):

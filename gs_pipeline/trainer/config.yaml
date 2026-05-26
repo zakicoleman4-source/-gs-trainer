@@ -43,7 +43,8 @@ sh:
 regularization:
   opacity_reg: 0.005             # halved from 0.01 — less suppression = sharper detail
   scale_reg: 0.005               # halved from 0.01 — allow tighter splat fitting
-  depth_reg_weight: 0.001        # edge-aware depth smoothness; 0 to disable
+  depth_reg_weight: 0.001        # edge-aware depth smoothness (1st order); 0 to disable
+  depth_lap_weight: 0.0002       # depth Laplacian (2nd order, planar surfaces); 0 to disable
   multiscale_loss_weight: 0.5    # 0.5× downsampled L1 alongside full-res; 0 = off
   sh_freq_reg_weight: 0.01       # decaying L2 on SH rest bands; reaches 0 at 50% of training
 

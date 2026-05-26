@@ -142,6 +142,20 @@ def render_live_dashboard(
     if js.state is State.FAILED:
         st.error(f"Training failed: {js.error_msg or '(no detail)'}")
 
+    # --- Live metrics tiles (during training) -----------------------------
+    if js.state is State.TRAINING:
+        psnr_hist = js.progress.psnr_history
+        ssim_hist = js.progress.ssim_history
+        if psnr_hist or ssim_hist:
+            _tc = st.columns(3)
+            if psnr_hist:
+                _tc[0].metric("Holdout PSNR", f"{psnr_hist[-1][1]:.2f} dB",
+                              delta=f"{psnr_hist[-1][1] - psnr_hist[0][1]:.2f} dB" if len(psnr_hist) > 1 else None)
+            if ssim_hist:
+                _tc[1].metric("Holdout SSIM", f"{ssim_hist[-1][1]:.3f}",
+                              delta=f"{ssim_hist[-1][1] - ssim_hist[0][1]:.3f}" if len(ssim_hist) > 1 else None)
+            _tc[2].metric("Splats", f"{js.progress.current_splats / 1e6:.2f} M")
+
     # --- Metrics charts ---------------------------------------------------
     rows = metrics_csv_rows(js.outputs.metrics_csv)
     if rows:
@@ -254,6 +268,51 @@ def render_live_dashboard(
                     data=f.read(), file_name="scene_unfiltered.ply",
                     mime="application/octet-stream", key="dl_unfiltered",
                 )
+
+    # --- Interactive re-filter (DONE state only) --------------------------
+    if js.state is State.DONE:
+        final_unf2 = getattr(js.outputs, "final_ply_unfiltered", None)
+        if final_unf2 and Path(final_unf2).is_file():
+            with st.expander("Re-filter scene (choose intensity)"):
+                _FILTER_PRESETS = {
+                    "light":      dict(min_opacity=0.002, sor_k=10, sor_std_ratio=3.0,   max_scale_factor=20.0),
+                    "default":    dict(min_opacity=0.005, sor_k=20, sor_std_ratio=2.0,   max_scale_factor=10.0),
+                    "aggressive": dict(min_opacity=0.010, sor_k=30, sor_std_ratio=1.5,   max_scale_factor=5.0),
+                    "extreme":    dict(min_opacity=0.050, sor_k=50, sor_std_ratio=1.0,   max_scale_factor=3.0),
+                }
+                preset_name = st.selectbox(
+                    "Filter preset", list(_FILTER_PRESETS.keys()), index=1,
+                    help="'light' keeps more splats; 'extreme' is most aggressive.",
+                )
+                if st.button("Apply filter and download", key="refilter_btn"):
+                    try:
+                        from gs_pipeline.trainer.export_ply import read_inria_ply, write_inria_ply
+                        from gs_pipeline.trainer.filter_splats import filter_scene
+                        import tempfile, io
+
+                        loaded = read_inria_ply(Path(final_unf2))
+                        cfg = _FILTER_PRESETS[preset_name]
+                        m, sc, q, o, dc, rest, rpt = filter_scene(
+                            means=loaded.means, scales=loaded.scales, quats=loaded.quats,
+                            opacities=loaded.opacities, sh_dc=loaded.sh_dc, sh_rest=loaded.sh_rest,
+                            min_opacity=cfg["min_opacity"], sor_k=cfg["sor_k"],
+                            sor_std_ratio=cfg["sor_std_ratio"], max_scale_factor=cfg["max_scale_factor"],
+                        )
+                        pct = 100.0 * (1 - rpt.n_output / max(rpt.n_input, 1))
+                        st.info(f"{rpt.n_input:,} → {rpt.n_output:,} splats ({pct:.1f}% removed)")
+                        with tempfile.NamedTemporaryFile(suffix=".ply", delete=False) as tmp:
+                            tmp_path = Path(tmp.name)
+                        write_inria_ply(out_path=tmp_path, means=m, scales=sc, quats=q,
+                                        opacities=o, sh_dc=dc, sh_rest=rest)
+                        st.download_button(
+                            f"Download scene_{preset_name}.ply",
+                            data=tmp_path.read_bytes(),
+                            file_name=f"scene_{preset_name}.ply",
+                            mime="application/octet-stream",
+                            key="refilter_dl",
+                        )
+                    except Exception as _e:
+                        st.error(f"Re-filter failed: {_e}")
 
     # --- Notes / warnings -------------------------------------------------
     if js.preflight and js.preflight.notes:
