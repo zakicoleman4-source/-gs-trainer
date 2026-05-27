@@ -88,7 +88,11 @@ def run_preflight(
         for name in zf.namelist():
             if Path(name).is_absolute() or ".." in Path(name).parts:
                 raise ValueError(f"bundle contains unsafe path {name!r}")
-        zf.extractall(extract_to)
+        try:
+            zf.extractall(extract_to)
+        except Exception:
+            shutil.rmtree(extract_to, ignore_errors=True)
+            raise
 
     cameras_xml = extract_to / "cameras.xml"
     dense_ply = extract_to / "dense.ply"

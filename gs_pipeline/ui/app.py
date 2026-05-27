@@ -76,6 +76,7 @@ def _phase_upload() -> None:
         with st.spinner("Reading bundle and computing preflight…"):
             report = run_preflight(zip_path, quality_preset=quality)
     except Exception as exc:
+        shutil.rmtree(upload_dir, ignore_errors=True)
         st.error(f"Bundle is not usable: {type(exc).__name__}: {exc}")
         return
 
@@ -150,18 +151,22 @@ def _start_training(report: PreflightReport, quality: str) -> None:
     """
     import json as _json
     zip_path = Path(st.session_state["uploaded_bundle_path"])
+    upload_dir = zip_path.parent
     DEFAULT_INBOX.mkdir(parents=True, exist_ok=True)
     target = DEFAULT_INBOX / zip_path.name
     if target.exists():
-        # Avoid clobbering an existing job's zip; suffix with a counter.
         i = 1
         while (DEFAULT_INBOX / f"{zip_path.stem}_{i}.zip").exists():
             i += 1
         target = DEFAULT_INBOX / f"{zip_path.stem}_{i}.zip"
     shutil.move(str(zip_path), str(target))
-    # Write per-job opts so the watcher can honour the UI's quality choice.
+    shutil.rmtree(upload_dir, ignore_errors=True)
     opts = {"quality": quality}
-    target.with_suffix(".opts.json").write_text(_json.dumps(opts), encoding="utf-8")
+    opts_path = target.with_suffix(".opts.json")
+    with open(opts_path, "w", encoding="utf-8") as f:
+        f.write(_json.dumps(opts))
+        f.flush()
+        os.fsync(f.fileno())
     # The watcher will rename to claim__<id>__name.zip; we discover the id
     # by polling inbox/ for that prefix on the live dashboard.
     st.session_state["expected_bundle_name"] = target.name

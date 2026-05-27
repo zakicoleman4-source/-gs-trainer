@@ -197,7 +197,10 @@ def _recover_stale_claims(paths: WatcherPaths) -> int:
             js.state = State.FAILED
             js.status_msg = "failed"
         from gs_pipeline.trainer.job_state import write_state
-        write_state(js, state_path)
+        try:
+            write_state(js, state_path)
+        except Exception as e:
+            _log.error("Failed to write failed state for %s: %s", job_id, e)
         _unclaim(claim_path, inbox)
         recovered += 1
         _log.warning(
@@ -290,13 +293,12 @@ def _claim_next(inbox: Path, *, settle_seconds: float = 2.0) -> Optional[Path]:
             candidate.rename(claimed_path)
         except FileNotFoundError:
             continue  # someone else grabbed it (shouldn't happen with one worker, but safe)
-        # Rename companion opts sidecar so it tracks the claim.
         opts_src = candidate.with_suffix(".opts.json")
         if opts_src.exists():
             try:
                 opts_src.rename(claimed_path.with_suffix(".opts.json"))
-            except OSError:
-                pass
+            except OSError as e:
+                _log.warning("Failed to rename opts sidecar %s: %s", opts_src, e)
         return claimed_path
     return None
 
@@ -312,8 +314,8 @@ def _read_opts_quality(claim_path: Path, *, default: str = "Auto") -> str:
         q = opts.get("quality", default)
         if q in ("Auto", "Maximum"):
             return q
-    except Exception:
-        pass
+    except Exception as e:
+        _log.warning("Failed to read opts from %s: %s", opts_path, e)
     return default
 
 

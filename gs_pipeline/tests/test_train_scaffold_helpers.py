@@ -116,7 +116,7 @@ def test_voxel_init_from_point_cloud_shapes():
 
 def test_inverse_sigmoid_roundtrip():
     """sigmoid(inverse_sigmoid(x)) == x for valid inputs."""
-    import torch
+    torch = pytest.importorskip("torch")
     from gs_pipeline.trainer.train_scaffold import _inverse_sigmoid
     x = torch.tensor([0.01, 0.1, 0.5, 0.9, 0.99])
     logits = _inverse_sigmoid(x)

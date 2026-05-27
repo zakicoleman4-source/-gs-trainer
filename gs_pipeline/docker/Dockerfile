@@ -57,7 +57,10 @@ RUN python -m pip install --no-build-isolation gsplat==1.4.0
 # Sanity check: verify that the python binary we'll use at runtime can
 # actually import the packages we just installed. Catches pip/Python version
 # mismatches (e.g. pip installed to python3.10 but python -> python3.11).
-RUN python -c "import numpy, plyfile, yaml, PIL; print('runtime import check OK')"
+RUN python -c "\
+  import numpy, plyfile, yaml, PIL, streamlit, torch, gsplat; \
+  print(f'torch {torch.__version__}, gsplat {gsplat.__version__}'); \
+  print('runtime import check OK')"
 
 # Application code. Build context is the gs_pipeline package directory
 # (see docker-compose.yml: context = ..), so `.` here is the package root

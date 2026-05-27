@@ -69,6 +69,8 @@ from gs_pipeline.trainer.render_eval import (
 
 _log = logging.getLogger(__name__)
 
+_MAX_OOM_RECOVERIES = 4
+
 
 # ---------------------------------------------------------------------------
 # Plain dataclass for trainer config (typed view of config.yaml)
@@ -464,7 +466,6 @@ def train(
     # Timelapse: collect one preview strip frame per checkpoint for final MP4.
     _timelapse_frames: list[Path] = []
     _oom_count = 0
-    _MAX_OOM_RECOVERIES = 5
 
     import os as _os, signal as _signal
     watchdog = ProgressWatchdog(
@@ -961,7 +962,7 @@ def _oom_recovery(
     clear_cuda_cache()
 
     n_before = means.shape[0]
-    if oom_count >= 5 or n_before < 10_000:
+    if oom_count >= _MAX_OOM_RECOVERIES or n_before < 10_000:
         raise RuntimeError(
             f"OOM recovery exhausted after {oom_count + 1} attempts "
             f"({n_before:,} splats remaining). GPU memory too small for this scene."

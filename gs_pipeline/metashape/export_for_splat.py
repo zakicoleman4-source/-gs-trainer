@@ -384,7 +384,7 @@ def _camera_photo_path(camera: Any) -> Optional[str]:
             return p
     label = getattr(camera, "label", None)
     if label and Path(label).suffix:
-        return None
+        return label
     return None
 
 

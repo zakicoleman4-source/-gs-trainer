@@ -276,6 +276,10 @@ class ProgressWatchdog:
                 last_step = self._last_step
             if elapsed > self.timeout_s:
                 self.stalled = True
+                _log.warning(
+                    "Training stalled: no tick for %.1fs at step %d",
+                    elapsed, last_step,
+                )
                 try:
                     self.on_stall(last_step)
                 except BaseException:
