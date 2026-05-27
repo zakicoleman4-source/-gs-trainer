@@ -88,7 +88,7 @@ The `test_set_memory_fraction` test fails when CUDA is present (expects no-GPU).
 The `test_ui` tests require streamlit.
 
 ## Docker
-- Image: `swdsfd/gs-trainer:v0.1.1` on Docker Hub (linux/amd64). v0.1.0 is BROKEN (worker crash).
+- Image: `swdsfd/gs-trainer:v0.1.6` on Docker Hub (linux/amd64). v0.1.0 is BROKEN (worker crash).
 - Run: `docker run --gpus all -p 8501:8501 -v inbox:/data/inbox -v outbox:/data/outbox -v logs:/data/logs -v work:/data/work swdsfd/gs-trainer:v0.1.1`
 - Tag a release: `git tag v0.X.Y && git push origin v0.X.Y` -> workflow pushes :vX.Y.Z, :latest
 - GPU arch support: `7.0;7.5;8.0;8.6;8.9;9.0` (Volta V100, Turing RTX 2000/T4, Ampere, Ada, Hopper)
@@ -220,6 +220,10 @@ User can compare filter levels: no_filter, light, default, aggressive, extreme.
 - `ffmpeg` added to Dockerfile (needed for training timelapse)
 - `TORCH_CUDA_ARCH_LIST` expanded to include Volta (7.0) and Turing (7.5)
 - `MAX_IMAGE_SIDE` removed from docker-compose.yml (now VRAM-adaptive via budget.py)
+- **v0.1.6:** added `python3.11-dev` (Python.h for C extensions), `libopenblas-dev`
+  (BLAS/LAPACK for scipy), Pillow system headers (libjpeg-dev, libpng-dev, zlib1g-dev,
+  libtiff-dev, libwebp-dev, libfreetype-dev), `libgomp1` (OpenMP runtime), `pkg-config`.
+  Build-time smoke test now imports ALL 16 packages (was only 4).
 
 ## Scaffold-GS trainer (`train_scaffold.py`)
 Alternative to MCMC for +1 dB PSNR (~30.13 vs ~29.18 on MipNeRF360). Selected via
