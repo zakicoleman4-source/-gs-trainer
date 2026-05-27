@@ -23,7 +23,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # System packages.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.11 python3.11-venv python3-pip \
+    python3.11 python3.11-dev python3.11-venv python3-pip \
     build-essential ninja-build git curl ca-certificates \
     supervisor libgl1 libglib2.0-0 ffmpeg \
  && rm -rf /var/lib/apt/lists/* \
