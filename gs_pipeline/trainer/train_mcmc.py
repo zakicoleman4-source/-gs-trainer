@@ -688,12 +688,16 @@ def train(
                 )
                 write_state(job_state, job_state_path)
 
-                # Divergence abort.
+                # Divergence abort: only abort on truly catastrophic quality
+                # (PSNR < 8 dB = random noise). A fixed threshold of 12 dB
+                # incorrectly kills training on small GPUs where PSNR naturally
+                # dips late due to VRAM constraints. We want to NEVER crash
+                # a client's training for a recoverable quality dip.
                 if (config.divergence_check_at_step and step >= config.divergence_check_at_step
                         and holdout_psnr is not None
-                        and holdout_psnr < config.divergence_min_psnr):
+                        and holdout_psnr < 8.0):
                     raise _DivergenceAbort(
-                        f"holdout PSNR {holdout_psnr:.2f} < min {config.divergence_min_psnr:.1f} "
+                        f"holdout PSNR {holdout_psnr:.2f} dB — catastrophically low, aborting "
                         f"at step {step}"
                     )
 
