@@ -214,11 +214,27 @@ def auto_adjust_config_for_scene(config: TrainerConfig, n_cameras: int) -> Train
     Small scenes need smaller holdout_stride (don't hold out too much data),
     faster divergence detection, and lower splat cap (underconstrained geometry).
     Large scenes need larger holdout_stride (evaluation is expensive).
+
+    For very small scenes (< 6 cameras) we must ensure at least 2 training
+    cameras remain after holdout — otherwise training is severely
+    underconstrained or even impossible.
     """
     from dataclasses import replace
-    if n_cameras < 30:
+    if n_cameras < 6:
+        # Very small scenes: holdout every N cameras such that at least 2
+        # training cameras remain. For 3 cameras + stride 3: holdout=[0],
+        # train=[1,2]. For 2 cameras: stride must be > n_cameras to keep
+        # at least 1 training cam.
+        stride = max(n_cameras, 2)  # effectively hold out only camera 0
         return replace(config,
-            holdout_stride=2,
+            holdout_stride=stride,
+            divergence_check_at_step=3_000,
+            divergence_min_psnr=8.0,   # very low bar for tiny scenes
+            eval_every=2000,
+        )
+    elif n_cameras < 30:
+        return replace(config,
+            holdout_stride=3,
             divergence_check_at_step=3_000,
             divergence_min_psnr=10.0,   # lower bar for tiny scenes
         )
@@ -674,6 +690,7 @@ def train(
 
                 # Divergence abort.
                 if (config.divergence_check_at_step and step >= config.divergence_check_at_step
+                        and holdout_psnr is not None
                         and holdout_psnr < config.divergence_min_psnr):
                     raise _DivergenceAbort(
                         f"holdout PSNR {holdout_psnr:.2f} < min {config.divergence_min_psnr:.1f} "
@@ -1151,9 +1168,30 @@ def _tick(job_state: JobState, path: Path, *, step: int, splats: int, loss: floa
     write_state(job_state, path)
 
 
-def _add_checkpoint(job_state: JobState, ckpt_path: str) -> None:
+def _add_checkpoint(job_state: JobState, ckpt_path: str, *, keep_last: int = 3) -> None:
+    """Register a checkpoint and remove old ones to bound disk usage.
+
+    Keeps the ``keep_last`` most recent checkpoints plus the corresponding
+    intermediate PLY files. Older checkpoints are deleted from disk.
+    """
     if ckpt_path not in job_state.outputs.checkpoints:
         job_state.outputs.checkpoints.append(ckpt_path)
+    # Prune old checkpoints from disk (keep the last N).
+    if len(job_state.outputs.checkpoints) > keep_last:
+        to_remove = job_state.outputs.checkpoints[:-keep_last]
+        job_state.outputs.checkpoints = job_state.outputs.checkpoints[-keep_last:]
+        for old_ckpt in to_remove:
+            try:
+                old_path = Path(old_ckpt)
+                if old_path.is_file():
+                    old_path.unlink()
+                # Also remove the companion intermediate PLY.
+                step_str = old_path.stem.replace("ckpt_", "")
+                ply_path = old_path.parent / f"scene_step_{step_str}.ply"
+                if ply_path.is_file():
+                    ply_path.unlink()
+            except OSError:
+                pass
 
 
 def _compile_timelapse(frame_paths: list[Path], out_path: Path, fps: int = 10) -> bool:

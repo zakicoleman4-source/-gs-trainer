@@ -193,3 +193,19 @@ def test_image_resolution_via_extension_search(tmp_path: Path):
     xml_path.write_text(text)
     scene = parse_cameras_xml(xml_path, image_dir=bundle.root / "images")
     assert any(p.name == "cam_000.png" for p in scene.image_paths)
+
+
+def test_windows_absolute_path_in_label(tmp_path: Path):
+    """Camera labels with Windows absolute paths should resolve to the filename."""
+    bundle = build_bundle(tmp_path / "b", n_cameras=2, image_size=64)
+    xml_path = bundle.root / "cameras.xml"
+    # Replace the label with a Windows-style absolute path.
+    text = xml_path.read_text().replace(
+        'label="cam_000.png"',
+        r'label="C:\Users\John\Photos\cam_000.png"',
+    )
+    xml_path.write_text(text)
+    scene = parse_cameras_xml(xml_path, image_dir=bundle.root / "images")
+    # Should resolve cam_000.png despite the Windows prefix.
+    assert len(scene.image_paths) == 2
+    assert any(p.name == "cam_000.png" for p in scene.image_paths)

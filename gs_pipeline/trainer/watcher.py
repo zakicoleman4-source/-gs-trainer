@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
-from gs_pipeline.trainer.job_state import JobState, safe_read_state, state_path_for
+from gs_pipeline.trainer.job_state import JobState, State, safe_read_state, state_path_for
 
 # Lazy-import pipeline to avoid pulling in numpy/plyfile at watcher startup.
 # pipeline.py imports init_from_pcd.py (numpy + plyfile) and parse_metashape.py
@@ -83,7 +83,9 @@ def process_one(
     Runs entirely in-process — no subprocess. This is what the integration
     test exercises.
     """
-    zip_path = _claim_next(paths.inbox)
+    # In-process mode (tests): no settle delay — files are created and
+    # consumed in the same process with no upload-in-progress risk.
+    zip_path = _claim_next(paths.inbox, settle_seconds=0.0)
     if zip_path is None:
         return None
     job_id = _job_id_from_claim(zip_path)
@@ -148,6 +150,80 @@ def process_one_subprocess(
     return zip_path
 
 
+def _recover_stale_claims(paths: WatcherPaths) -> int:
+    """Mark jobs left in non-terminal state as FAILED on startup.
+
+    When the container restarts mid-training, claimed zips stay in inbox/ and
+    their ``state.json`` is stuck in TRAINING/PREFLIGHT. This function:
+    1. Scans inbox/ for ``claim__*`` files.
+    2. For each, reads ``state.json`` from the work directory.
+    3. If the state is non-terminal (QUEUED/PREFLIGHT/TRAINING/RESUMING),
+       marks it FAILED so the UI shows the correct status.
+    4. Unclaims the zip (renames back to original name) so the user can
+       resubmit if desired.
+
+    Returns the number of stale jobs recovered.
+    """
+    inbox = Path(paths.inbox)
+    recovered = 0
+    for claim_path in list(inbox.glob(f"{CLAIM_PREFIX}*.zip")):
+        try:
+            job_id = _job_id_from_claim(claim_path)
+        except ValueError:
+            continue
+        state_path = state_path_for(paths.work, job_id)
+        js = safe_read_state(state_path)
+        if js is None:
+            # No state.json yet — job never got past claiming. Unclaim so it
+            # can be retried.
+            _unclaim(claim_path, inbox)
+            recovered += 1
+            _log.warning(
+                "Recovered stale claim %s (no state.json) — unclaimed for resubmission",
+                claim_path.name,
+            )
+            continue
+        if js.state in (State.DONE, State.FAILED):
+            # Terminal state — nothing to recover. Leave the claim in place.
+            continue
+        # Non-terminal: mark as failed.
+        try:
+            js.mark_failed(
+                "Job interrupted by container restart or worker crash. "
+                "The original bundle has been unclaimed for resubmission."
+            )
+        except Exception:
+            js.error_msg = "Job interrupted by container restart or worker crash."
+            js.state = State.FAILED
+            js.status_msg = "failed"
+        from gs_pipeline.trainer.job_state import write_state
+        write_state(js, state_path)
+        _unclaim(claim_path, inbox)
+        recovered += 1
+        _log.warning(
+            "Recovered stale job %s (was %s) — marked FAILED, unclaimed",
+            job_id, js.state.value if hasattr(js.state, 'value') else js.state,
+        )
+    return recovered
+
+
+def _unclaim(claim_path: Path, inbox: Path) -> None:
+    """Rename a claim__<id>__<name>.zip back to <name>.zip for resubmission."""
+    original_name = _original_name(claim_path)
+    target = inbox / original_name
+    if target.exists():
+        # Avoid clobbering; add a suffix.
+        i = 1
+        stem = Path(original_name).stem
+        while (inbox / f"{stem}_{i}.zip").exists():
+            i += 1
+        target = inbox / f"{stem}_{i}.zip"
+    try:
+        claim_path.rename(target)
+    except OSError as e:
+        _log.warning("Failed to unclaim %s: %s", claim_path, e)
+
+
 def run_forever(
     paths: WatcherPaths,
     *,
@@ -160,6 +236,11 @@ def run_forever(
     Pass a ``threading.Event`` as ``stop_event`` to break the loop cleanly
     (the integration test does this).
     """
+    # On startup, recover any jobs left in non-terminal state from a prior crash.
+    n_recovered = _recover_stale_claims(paths)
+    if n_recovered:
+        _log.info("Recovered %d stale job(s) on startup", n_recovered)
+
     while True:
         if stop_event is not None and stop_event.is_set():
             return
@@ -177,21 +258,29 @@ def run_forever(
 # Inbox queue mechanics
 # ---------------------------------------------------------------------------
 
-def _claim_next(inbox: Path) -> Optional[Path]:
+def _claim_next(inbox: Path, *, settle_seconds: float = 2.0) -> Optional[Path]:
     """Atomically rename the oldest unclaimed .zip to a claim__<job>__name path.
 
     Returns the renamed path (now safe to operate on), or None if no
     unclaimed zip exists. Also renames a companion ``.opts.json`` sidecar
     (written by the UI with per-job quality settings) so it stays alongside.
+
+    Files whose mtime is less than ``settle_seconds`` ago are skipped — they
+    may still be in the process of being written (upload in progress). They
+    will be picked up on the next scan.
     """
     inbox = Path(inbox)
+    now = time.time()
+
     def _safe_mtime(p: Path) -> float:
         try:
             return p.stat().st_mtime
         except OSError:
             return float("inf")
     candidates = sorted(
-        (p for p in inbox.glob("*.zip") if not p.name.startswith(CLAIM_PREFIX)),
+        (p for p in inbox.glob("*.zip")
+         if not p.name.startswith(CLAIM_PREFIX)
+         and now - _safe_mtime(p) >= settle_seconds),
         key=_safe_mtime,
     )
     for candidate in candidates:

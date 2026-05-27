@@ -467,7 +467,7 @@ def _preflight_snapshot(budget: Budget) -> PreflightSnapshot:
         gpu_name=budget.gpu.name,
         gpu_total_vram_bytes=budget.gpu.total_vram_bytes,
         notes=list(budget.notes),
-        downscale_per_camera=[budget.downscale_factor] * budget.n_cameras,
+        downscale_per_camera=list(budget.downscale_per_camera) if budget.downscale_per_camera else [budget.downscale_factor] * budget.n_cameras,
     )
 
 

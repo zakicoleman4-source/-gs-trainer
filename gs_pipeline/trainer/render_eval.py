@@ -186,8 +186,21 @@ def save_preview_png(
             near_plane=near_plane, far_plane=far_plane,
         )
     arr = (pred.detach().cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    Image.fromarray(arr).save(out_path)
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    # Atomic write: temp file + rename so the UI never reads a partial PNG.
+    import tempfile as _tmpmod, os as _os
+    fd, tmp_name = _tmpmod.mkstemp(suffix=".png", dir=str(out_path.parent))
+    try:
+        _os.close(fd)
+        Image.fromarray(arr).save(tmp_name)
+        _os.replace(tmp_name, str(out_path))
+    except Exception:
+        try:
+            _os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def save_preview_strip(
@@ -309,8 +322,22 @@ def save_preview_strip(
             strip_parts.append(pair)
 
     strip = np.concatenate(strip_parts, axis=1)
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    Image.fromarray(strip).save(out_path)
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    # Atomic write: save to a temp file then rename, so the UI never reads
+    # a half-written PNG (same pattern as job_state.write_state).
+    import tempfile as _tmpmod, os as _os
+    fd, tmp_name = _tmpmod.mkstemp(suffix=".png", dir=str(out_path.parent))
+    try:
+        _os.close(fd)
+        Image.fromarray(strip).save(tmp_name)
+        _os.replace(tmp_name, str(out_path))
+    except Exception:
+        try:
+            _os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 # ---------------------------------------------------------------------------

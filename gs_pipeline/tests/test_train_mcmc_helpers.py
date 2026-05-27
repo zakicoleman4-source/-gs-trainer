@@ -166,10 +166,16 @@ def test_load_trainer_config_maximum_preset_iterations(tmp_path: Path):
 def test_auto_adjust_config_small_scene():
     from gs_pipeline.trainer.train_mcmc import auto_adjust_config_for_scene, TrainerConfig
     base = TrainerConfig()
-    # Very small scene gets tighter holdout
-    tiny = auto_adjust_config_for_scene(base, n_cameras=20)
-    assert tiny.holdout_stride == 2
-    assert tiny.divergence_check_at_step == 3_000
+    # Small scene (< 30 cameras) gets tighter holdout
+    small = auto_adjust_config_for_scene(base, n_cameras=20)
+    assert small.holdout_stride == 3
+    assert small.divergence_check_at_step == 3_000
+
+    # Very small scene (< 6 cameras) uses stride = n_cameras to keep
+    # nearly all cameras for training.
+    tiny = auto_adjust_config_for_scene(base, n_cameras=4)
+    assert tiny.holdout_stride >= 4  # only camera 0 held out
+    assert tiny.divergence_min_psnr == 8.0
 
 
 def test_auto_adjust_config_medium_scene_unchanged():
@@ -186,6 +192,28 @@ def test_auto_adjust_config_large_scene():
     large = auto_adjust_config_for_scene(base, n_cameras=1500)
     assert large.holdout_stride == 16
     assert large.eval_every == 2000
+
+
+def test_auto_adjust_very_small_scene_keeps_training_cameras():
+    """With 3 cameras, auto_adjust must leave at least 2 for training."""
+    from gs_pipeline.trainer.train_mcmc import auto_adjust_config_for_scene, TrainerConfig
+    cfg = auto_adjust_config_for_scene(TrainerConfig(), n_cameras=3)
+    holdout_idx = list(range(0, 3, max(cfg.holdout_stride, 1)))
+    train_idx = [i for i in range(3) if i not in set(holdout_idx)]
+    assert len(train_idx) >= 2, (
+        f"Only {len(train_idx)} training cameras with stride={cfg.holdout_stride}"
+    )
+
+
+def test_auto_adjust_2_cameras_preserves_training():
+    """Even 2 cameras must keep at least 1 training camera."""
+    from gs_pipeline.trainer.train_mcmc import auto_adjust_config_for_scene, TrainerConfig
+    cfg = auto_adjust_config_for_scene(TrainerConfig(), n_cameras=2)
+    holdout_idx = list(range(0, 2, max(cfg.holdout_stride, 1)))
+    train_idx = [i for i in range(2) if i not in set(holdout_idx)]
+    assert len(train_idx) >= 1, (
+        f"0 training cameras with stride={cfg.holdout_stride}"
+    )
 
 
 # ---------------------------------------------------------------------------

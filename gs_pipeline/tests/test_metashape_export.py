@@ -283,7 +283,7 @@ def test_claim_next_also_renames_opts_sidecar(tmp_path: Path):
     opts_file = zip_file.with_suffix(".opts.json")
     opts_file.write_text(json.dumps({"quality": "Maximum"}))
 
-    claimed = _claim_next(inbox)
+    claimed = _claim_next(inbox, settle_seconds=0.0)
     assert claimed is not None
     assert claimed.name.startswith(CLAIM_PREFIX)
     assert not opts_file.exists()

@@ -293,3 +293,109 @@ def test_claim_helpers_extract_id_and_name():
     claim = Path("/inbox/claim__abcdef012345__my_scene.zip")
     assert _job_id_from_claim(claim) == "abcdef012345"
     assert _original_name(claim) == "my_scene.zip"
+
+
+def test_recover_stale_claims_marks_failed(tmp_job_root: Path, bundle_zip: Path):
+    """_recover_stale_claims marks non-terminal jobs as FAILED and unclaims."""
+    import shutil
+    from gs_pipeline.trainer.watcher import (
+        _recover_stale_claims, CLAIM_PREFIX, WatcherPaths,
+    )
+    from gs_pipeline.trainer.job_state import (
+        new_job_state, write_state, read_state, state_path_for, State,
+    )
+
+    paths = WatcherPaths(
+        inbox=tmp_job_root / "inbox", work=tmp_job_root / "work",
+        outbox=tmp_job_root / "outbox", logs=tmp_job_root / "logs",
+    )
+
+    # Simulate a claimed zip with a mid-training state.json
+    job_id = "deadbeef1234"
+    claimed_zip = paths.inbox / f"{CLAIM_PREFIX}{job_id}__scene.zip"
+    shutil.copy(bundle_zip, claimed_zip)
+
+    js = new_job_state(job_id)
+    js.start_preflight()
+    from gs_pipeline.trainer.job_state import PreflightSnapshot
+    js.start_training(PreflightSnapshot(
+        n_cameras=10, total_megapixels=50.0, dense_pts=100_000,
+        target_splats=500_000, hard_cap_splats=10_000_000,
+        iterations=40_000, downscale_factor=1.0, image_max_side=2000,
+        quality_preset="Auto", gpu_name="test", gpu_total_vram_bytes=24_000_000_000,
+    ))
+    state_path = state_path_for(paths.work, job_id)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    write_state(js, state_path)
+
+    # Recover.
+    n = _recover_stale_claims(paths)
+    assert n == 1
+
+    # State should now be FAILED.
+    recovered_js = read_state(state_path)
+    assert recovered_js.state is State.FAILED
+    assert "interrupted" in recovered_js.error_msg.lower()
+
+    # Claimed zip should have been unclaimed.
+    assert not claimed_zip.exists()
+    unclaimed = list(paths.inbox.glob("scene*.zip"))
+    assert len(unclaimed) == 1
+    assert not unclaimed[0].name.startswith(CLAIM_PREFIX)
+
+
+def test_recover_stale_claims_skips_terminal(tmp_job_root: Path, bundle_zip: Path):
+    """_recover_stale_claims does NOT touch jobs already in DONE state."""
+    import shutil
+    from gs_pipeline.trainer.watcher import (
+        _recover_stale_claims, CLAIM_PREFIX, WatcherPaths,
+    )
+    from gs_pipeline.trainer.job_state import (
+        new_job_state, write_state, read_state, state_path_for, State,
+        OutputsSnapshot, PreflightSnapshot,
+    )
+
+    paths = WatcherPaths(
+        inbox=tmp_job_root / "inbox", work=tmp_job_root / "work",
+        outbox=tmp_job_root / "outbox", logs=tmp_job_root / "logs",
+    )
+
+    job_id = "aabbccdd1234"
+    claimed_zip = paths.inbox / f"{CLAIM_PREFIX}{job_id}__scene.zip"
+    shutil.copy(bundle_zip, claimed_zip)
+
+    js = new_job_state(job_id)
+    js.start_preflight()
+    js.start_training(PreflightSnapshot(
+        n_cameras=10, total_megapixels=50.0, dense_pts=100_000,
+        target_splats=500_000, hard_cap_splats=10_000_000,
+        iterations=40_000, downscale_factor=1.0, image_max_side=2000,
+        quality_preset="Auto", gpu_name="test", gpu_total_vram_bytes=24_000_000_000,
+    ))
+    js.finish(OutputsSnapshot(final_ply="/fake/scene.ply"))
+    state_path = state_path_for(paths.work, job_id)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    write_state(js, state_path)
+
+    n = _recover_stale_claims(paths)
+    assert n == 0  # terminal state not recovered
+
+    recovered = read_state(state_path)
+    assert recovered.state is State.DONE
+    assert claimed_zip.exists()  # still claimed
+
+
+def test_settle_seconds_skips_fresh_files(tmp_path: Path):
+    """_claim_next with settle_seconds > 0 skips freshly-written files."""
+    from gs_pipeline.trainer.watcher import _claim_next
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    (inbox / "fresh.zip").write_bytes(b"PK")
+
+    # With a large settle window, the fresh file should be skipped.
+    claimed = _claim_next(inbox, settle_seconds=9999.0)
+    assert claimed is None
+
+    # With settle=0, it should be claimed.
+    claimed2 = _claim_next(inbox, settle_seconds=0.0)
+    assert claimed2 is not None

@@ -424,7 +424,20 @@ def _resolve_image(image_dir: Path, label: str, warnings: list[str]) -> Optional
 
     Tries the label as-is, then with common image extensions, then a recursive
     glob fallback. Returns None and appends a warning if nothing matches.
+
+    Handles Windows-style absolute paths in labels (e.g.
+    ``C:\\Users\\John\\Photos\\IMG_001.JPG``) by extracting the filename
+    component before searching.
     """
+    # Strip Windows-style absolute path prefix: if the label contains a
+    # backslash it's almost certainly a Windows path baked into cameras.xml.
+    # Extract just the filename for lookup.
+    if "\\" in label:
+        label = label.rsplit("\\", 1)[-1]
+    # Also handle forward-slash absolute paths (less common but possible).
+    if "/" in label and not (image_dir / label).is_file():
+        label = label.rsplit("/", 1)[-1]
+
     p = image_dir / label
     if p.is_file():
         return p
