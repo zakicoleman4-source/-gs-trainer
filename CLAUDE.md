@@ -88,12 +88,16 @@ The `test_set_memory_fraction` test fails when CUDA is present (expects no-GPU).
 The `test_ui` tests require streamlit.
 
 ## Docker
-- Image: `swdsfd/gs-trainer:edge` on Docker Hub (linux/amd64)
-- Run: `docker run --gpus all -p 8501:8501 -v inbox:/data/inbox -v outbox:/data/outbox -v logs:/data/logs -v work:/data/work swdsfd/gs-trainer:edge`
-- Tag a release: `git tag v0.1.0 && git push origin v0.1.0` -> workflow pushes :v0.1.0, :latest
+- Image: `swdsfd/gs-trainer:v0.1.1` on Docker Hub (linux/amd64). v0.1.0 is BROKEN (worker crash).
+- Run: `docker run --gpus all -p 8501:8501 -v inbox:/data/inbox -v outbox:/data/outbox -v logs:/data/logs -v work:/data/work swdsfd/gs-trainer:v0.1.1`
+- Tag a release: `git tag v0.X.Y && git push origin v0.X.Y` -> workflow pushes :vX.Y.Z, :latest
 - GPU arch support: `7.0;7.5;8.0;8.6;8.9;9.0` (Volta V100, Turing RTX 2000/T4, Ampere, Ada, Hopper)
 - ffmpeg is installed in the image (required for timelapse MP4 generation)
 - `MAX_IMAGE_SIDE` is NOT set in docker-compose.yml — budget.py picks it from VRAM at runtime
+- **IMPORTANT:** All `pip install` in the Dockerfile MUST use `python -m pip`, NOT bare `pip`.
+  The CUDA base image has python3.10 as system default; bare `pip` installs to python3.10's
+  site-packages, but the runtime `python` symlink points to python3.11. This caused the v0.1.0
+  worker crash (ImportError for numpy/plyfile at watcher startup).
 
 ## Key architectural decisions
 
