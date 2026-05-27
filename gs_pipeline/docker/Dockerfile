@@ -22,10 +22,21 @@ ENV DEBIAN_FRONTEND=noninteractive \
     MAX_JOBS=2
 
 # System packages.
+# python3.11-dev: provides Python.h — required to compile ANY C extension
+#   (numpy, scipy, Pillow, gsplat CUDA kernels, etc.).
+# libopenblas-dev: BLAS/LAPACK for scipy (and numpy's linalg).
+# libjpeg-dev, libpng-dev, zlib1g-dev, libtiff-dev, libwebp-dev,
+#   libfreetype-dev: Pillow build-time headers so it links against system
+#   imaging libs instead of bundling its own (smaller image, faster build).
+# libgomp1: OpenMP runtime needed by open3d and numpy BLAS at runtime.
+# pkg-config: lets build systems locate the above libraries.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.11 python3.11-venv python3-pip \
-    build-essential ninja-build git curl ca-certificates \
+    python3.11 python3.11-dev python3.11-venv python3-pip \
+    build-essential ninja-build git curl ca-certificates pkg-config \
     supervisor libgl1 libglib2.0-0 ffmpeg \
+    libopenblas-dev \
+    libjpeg-dev libpng-dev zlib1g-dev libtiff-dev libwebp-dev \
+    libfreetype-dev libgomp1 \
  && rm -rf /var/lib/apt/lists/* \
  && ln -sf /usr/bin/python3.11 /usr/local/bin/python \
  && ln -sf /usr/bin/python3.11 /usr/local/bin/python3
@@ -54,10 +65,34 @@ RUN python -m pip install -r requirements-gpu.txt
 # on smaller build hosts.
 RUN python -m pip install --no-build-isolation gsplat==1.4.0
 
-# Sanity check: verify that the python binary we'll use at runtime can
-# actually import the packages we just installed. Catches pip/Python version
-# mismatches (e.g. pip installed to python3.10 but python -> python3.11).
-RUN python -c "import numpy, plyfile, yaml, PIL; print('runtime import check OK')"
+# Comprehensive smoke test: verify that EVERY package the pipeline needs is
+# importable from the python3.11 runtime.  Catches:
+#   - pip/Python version mismatches (e.g. pip installed to python3.10)
+#   - missing system libraries (libopenblas, libjpeg, etc.)
+#   - broken CUDA extension builds (gsplat)
+# If ANY import fails the build aborts immediately — no more silent breakage.
+RUN python -c "\
+import sys; \
+print(f'Python {sys.version}'); \
+import numpy; print(f'numpy {numpy.__version__}'); \
+import scipy; print(f'scipy {scipy.__version__}'); \
+import scipy.spatial; \
+from PIL import Image; import PIL; print(f'Pillow {PIL.__version__}'); \
+import yaml; print(f'PyYAML {yaml.__version__}'); \
+import plyfile; print(f'plyfile {plyfile.__version__}'); \
+import watchdog; print(f'watchdog {watchdog.__version__}'); \
+import streamlit; print(f'streamlit {streamlit.__version__}'); \
+import torch; print(f'torch {torch.__version__}, CUDA {torch.version.cuda}'); \
+import torchvision; print(f'torchvision {torchvision.__version__}'); \
+import gsplat; print(f'gsplat {gsplat.__version__}'); \
+from gsplat import rasterization; \
+from gsplat.strategy import MCMCStrategy; \
+import open3d; print(f'open3d {open3d.__version__}'); \
+import matplotlib; print(f'matplotlib {matplotlib.__version__}'); \
+import skimage; print(f'scikit-image {skimage.__version__}'); \
+import tyro; print(f'tyro {tyro.__version__}'); \
+print('=== ALL IMPORTS OK ==='); \
+"
 
 # Application code. Build context is the gs_pipeline package directory
 # (see docker-compose.yml: context = ..), so `.` here is the package root
