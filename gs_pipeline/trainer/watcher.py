@@ -33,12 +33,13 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from gs_pipeline.trainer.job_state import JobState, safe_read_state, state_path_for
-from gs_pipeline.trainer.pipeline import (
-    job_log_dir,
-    job_outbox_dir,
-    job_work_dir,
-    run_job,
-)
+
+# Lazy-import pipeline to avoid pulling in numpy/plyfile at watcher startup.
+# pipeline.py imports init_from_pcd.py (numpy + plyfile) and parse_metashape.py
+# (numpy) at module level. The watcher daemon only needs the lightweight path
+# helpers and run_job, which are imported on first use inside function bodies.
+# This prevents the watcher from crashing in Docker if heavy deps aren't yet
+# importable (e.g. pip/Python version mismatch or missing native libraries).
 
 _log = logging.getLogger(__name__)
 
@@ -86,6 +87,7 @@ def process_one(
     if zip_path is None:
         return None
     job_id = _job_id_from_claim(zip_path)
+    from gs_pipeline.trainer.pipeline import run_job  # lazy import (heavy deps)
     return run_job(
         job_id=job_id,
         bundle_zip=zip_path,
@@ -118,7 +120,7 @@ def process_one_subprocess(
     if zip_path is None:
         return None
     job_id = _job_id_from_claim(zip_path)
-    log_dir = job_log_dir(paths.logs, job_id)
+    log_dir = Path(paths.logs) / job_id  # inline; avoids importing pipeline at module level
     log_dir.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
 
@@ -250,6 +252,10 @@ def _original_name(claim_path: Path) -> str:
 
 def watcher_main(argv: Optional[list] = None) -> int:
     """``python -m gs_pipeline.trainer.watcher`` entry point — starts ``run_forever``."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s  %(message)s",
+    )
     import argparse
     parser = argparse.ArgumentParser(description="Run the gs_pipeline inbox watcher.")
     parser.add_argument("--inbox", required=True, type=Path)
@@ -260,6 +266,7 @@ def watcher_main(argv: Optional[list] = None) -> int:
     parser.add_argument("--quality-preset", default="Auto", choices=["Auto", "Maximum"])
     parser.add_argument("--poll-interval", type=float, default=DEFAULT_POLL_INTERVAL)
     args = parser.parse_args(argv)
+    _log.info("watcher starting (inbox=%s)", args.inbox)
     paths = WatcherPaths(
         inbox=args.inbox, work=args.work, outbox=args.outbox,
         logs=args.logs, config_yaml=args.config_yaml,

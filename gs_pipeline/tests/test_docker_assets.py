@@ -50,6 +50,29 @@ def test_dockerfile_pins_torch_and_gsplat():
     assert "--no-build-isolation" in text
 
 
+def test_dockerfile_uses_python_m_pip():
+    """All pip installs must use `python -m pip`, not bare `pip`.
+
+    Bare `pip` / `pip3` resolve via shebang to the system python3.10 on
+    the nvidia/cuda:12.4.1 Ubuntu 22.04 base image, but the runtime
+    `python` symlink points to python3.11. Using `python -m pip` ensures
+    packages land in the correct site-packages directory.
+    """
+    text = _read_dockerfile()
+    # Every line that installs packages should use `python -m pip`
+    for line in text.splitlines():
+        stripped = line.strip()
+        # Skip continuation lines and non-pip lines
+        if stripped.startswith("#") or "pip install" not in stripped:
+            continue
+        # Allow `python -m pip install` but reject bare `pip install` or `pip3 install`
+        if stripped.startswith("pip install") or stripped.startswith("pip3 install"):
+            pytest.fail(
+                f"Dockerfile uses bare pip; must use `python -m pip` to avoid "
+                f"python version mismatch: {stripped!r}"
+            )
+
+
 def test_dockerfile_compiles_gsplat_with_max_jobs():
     """We pin MAX_JOBS to keep nvcc memory in check on small build hosts."""
     text = _read_dockerfile()
@@ -211,3 +234,54 @@ def test_entrypoint_is_executable():
     p = DOCKER_DIR / "entrypoint.sh"
     mode = p.stat().st_mode
     assert mode & stat.S_IXUSR, "entrypoint.sh is not executable; chmod +x"
+
+
+# ---------------------------------------------------------------------------
+# Watcher module — startup resilience
+# ---------------------------------------------------------------------------
+
+def test_watcher_imports_without_heavy_deps():
+    """The watcher daemon must import without numpy/plyfile/torch.
+
+    pipeline.py imports init_from_pcd (numpy + plyfile) and
+    parse_metashape (numpy) at module scope. If the watcher eagerly
+    imports pipeline.py at module level, it crashes before it even
+    parses its CLI arguments — which is exactly the supervisord failure
+    mode that killed the v0.1.0 container on client hardware.
+
+    This test monkey-blocks numpy and plyfile, then verifies the watcher
+    module still loads cleanly. If someone re-adds a top-level pipeline
+    import in watcher.py, this test will catch it.
+    """
+    import importlib
+    import sys
+
+    class _Blocker:
+        _BLOCKED = frozenset(("numpy", "plyfile"))
+
+        def find_module(self, name, path=None):
+            top = name.split(".")[0]
+            if top in self._BLOCKED:
+                return self
+            return None
+
+        def load_module(self, name):
+            raise ImportError(f"[test] blocked import of {name!r}")
+
+    blocker = _Blocker()
+    # Stash existing modules so we can restore them.
+    saved = {}
+    for key in list(sys.modules):
+        top = key.split(".")[0]
+        if top in _Blocker._BLOCKED or key.startswith("gs_pipeline.trainer."):
+            saved[key] = sys.modules.pop(key)
+
+    sys.meta_path.insert(0, blocker)
+    try:
+        mod = importlib.import_module("gs_pipeline.trainer.watcher")
+        assert hasattr(mod, "watcher_main")
+        assert hasattr(mod, "run_forever")
+    finally:
+        sys.meta_path.remove(blocker)
+        # Restore stashed modules so later tests aren't affected.
+        sys.modules.update(saved)

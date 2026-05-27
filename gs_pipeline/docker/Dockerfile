@@ -33,22 +33,31 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # CPU-side deps (Streamlit UI, parser, plyfile, numpy, etc.).
+# IMPORTANT: use `python -m pip` (not bare `pip`) so packages install into
+# the python3.11 that the symlink at /usr/local/bin/python points to.
+# Bare `pip` / `pip3` may resolve to the system python3.10 shebang and
+# install into the wrong site-packages, causing ImportError at runtime.
 COPY requirements-cpu.txt requirements-gpu.txt /app/
-RUN pip install --upgrade pip wheel setuptools \
- && pip install -r requirements-cpu.txt
+RUN python -m pip install --upgrade pip wheel setuptools \
+ && python -m pip install -r requirements-cpu.txt
 
 # Torch (cu124 wheels). Pinned to the version gsplat 1.4.x was tested with.
-RUN pip install --index-url https://download.pytorch.org/whl/cu124 \
+RUN python -m pip install --index-url https://download.pytorch.org/whl/cu124 \
     torch==2.4.1 torchvision==0.19.1
 
 # Other GPU deps (open3d, scikit-image, matplotlib).
-RUN pip install -r requirements-gpu.txt
+RUN python -m pip install -r requirements-gpu.txt
 
 # gsplat: precompile the CUDA extension at image build time so the container
 # never has to JIT on first inference. `--no-build-isolation` makes setup.py
 # see torch's headers; MAX_JOBS=2 keeps the parallel nvcc within memory bounds
 # on smaller build hosts.
-RUN pip install --no-build-isolation gsplat==1.4.0
+RUN python -m pip install --no-build-isolation gsplat==1.4.0
+
+# Sanity check: verify that the python binary we'll use at runtime can
+# actually import the packages we just installed. Catches pip/Python version
+# mismatches (e.g. pip installed to python3.10 but python -> python3.11).
+RUN python -c "import numpy, plyfile, yaml, PIL; print('runtime import check OK')"
 
 # Application code. Build context is the gs_pipeline package directory
 # (see docker-compose.yml: context = ..), so `.` here is the package root
