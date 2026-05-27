@@ -450,7 +450,12 @@ def train(
     _oom_count = 0
     _MAX_OOM_RECOVERIES = 5
 
-    watchdog = ProgressWatchdog(timeout_s=config.watchdog_timeout_s, poll_interval_s=config.watchdog_poll_interval_s)
+    import os as _os, signal as _signal
+    watchdog = ProgressWatchdog(
+        timeout_s=config.watchdog_timeout_s,
+        poll_interval_s=config.watchdog_poll_interval_s,
+        on_stall=lambda step: _os.kill(_os.getpid(), _signal.SIGTERM),
+    )
     watchdog.start()
 
     try:
@@ -646,12 +651,18 @@ def train(
                     sh_dc=sh_dc, sh_rest=sh_rest,
                     sh_degree=active_sh_degree, full_sh_degree=config.sh_degree,
                 )
-                holdout_psnr, holdout_ssim = evaluate_holdout(
-                    render_inputs, scene=scene, holdout_idx=holdout_idx,
-                    near_plane=near, far_plane=far, downscale=1.0,
-                )
-                with metrics_path.open("a", encoding="utf-8") as f:
-                    f.write(f"{step},{float(loss.item()):.6f},{holdout_psnr:.4f},{holdout_ssim:.4f}\n")
+                try:
+                    holdout_psnr, holdout_ssim = evaluate_holdout(
+                        render_inputs, scene=scene, holdout_idx=holdout_idx,
+                        near_plane=near, far_plane=far, downscale=1.0,
+                    )
+                except torch.cuda.OutOfMemoryError:
+                    clear_cuda_cache()
+                    _log.warning("OOM during eval at step %d — skipping eval this round", step)
+                    holdout_psnr, holdout_ssim = None, None
+                if holdout_psnr is not None:
+                    with metrics_path.open("a", encoding="utf-8") as f:
+                        f.write(f"{step},{float(loss.item()):.6f},{holdout_psnr:.4f},{holdout_ssim:.4f}\n")
                 job_state.tick(
                     current_step=step,
                     current_splats=means.shape[0],
@@ -779,7 +790,15 @@ def train(
                 "n_output": f_report.n_output,
                 "summary": f_report.summary,
             }
-            _final_np = (f_means, f_scales, f_quats, f_opacities, f_sh_dc, f_sh_rest)
+            if f_report.n_output == 0:
+                _log.warning("Filter removed ALL splats — falling back to unfiltered PLY")
+                _final_np = (
+                    loaded.means, loaded.scales, loaded.quats,
+                    loaded.opacities, loaded.sh_dc, loaded.sh_rest,
+                )
+                filter_report_dict["fallback"] = "all splats filtered — using unfiltered"
+            else:
+                _final_np = (f_means, f_scales, f_quats, f_opacities, f_sh_dc, f_sh_rest)
         else:
             _final_np = (
                 means.detach().cpu().numpy(),

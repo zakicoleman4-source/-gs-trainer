@@ -139,7 +139,8 @@ def run_job(
         # coordinates (UTM/ECEF positions like 500000,4000000 kill precision).
         import numpy as np
         centroid = init_cloud.xyz.mean(axis=0)
-        if np.linalg.norm(centroid) > 100.0:
+        _scene_centroid = centroid.copy() if np.linalg.norm(centroid) > 100.0 else None
+        if _scene_centroid is not None:
             _log.info(
                 "Centering scene (centroid at %.1f, %.1f, %.1f — likely georeferenced)",
                 *centroid,
@@ -272,8 +273,13 @@ def run_job(
                     downscale_per_camera=new_ds,
                     downscale_factor=max(new_ds) if new_ds else 1.0,
                 )
-                # Re-apply K scaling and image cache on fresh scene
+                # Re-apply centering + K scaling + image cache on fresh scene
                 scene = scene_orig
+                if _scene_centroid is not None:
+                    for i in range(len(scene)):
+                        w2c = scene.w2c_per_camera[i]
+                        R = w2c[:3, :3]
+                        scene.w2c_per_camera[i, :3, 3] += R @ _scene_centroid
                 for i, ds in enumerate(new_ds):
                     if ds < 1.0:
                         scene.K_per_camera[i, :2, :] *= ds

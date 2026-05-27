@@ -52,6 +52,7 @@ def subset_scene(scene: "ParsedScene", camera_indices: list[int]) -> "ParsedScen
         w2c_per_camera=scene.w2c_per_camera[idx],
         chunk_transform=scene.chunk_transform,
         image_paths=[scene.image_paths[i] for i in idx] if scene.image_paths else [],
+        mask_paths=[scene.mask_paths[i] for i in idx] if scene.mask_paths else [],
         warnings=[],
     )
 
