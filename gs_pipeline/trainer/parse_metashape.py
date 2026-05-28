@@ -52,6 +52,7 @@ all w2c matrices then.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -221,9 +222,20 @@ def parse_cameras_xml(
 
     warnings: list[str] = []
 
-    sensors = _parse_sensors(chunk, warnings)
+    sensor_reject_reasons: list[str] = []
+    sensors = _parse_sensors(chunk, warnings, sensor_reject_reasons)
     if not sensors:
-        raise ValueError("cameras.xml: <sensors> section empty or missing adjusted calibrations")
+        # Distinguish "no sensor elements at all" from "sensors present but every
+        # one was rejected" so the client gets an actionable message instead of a
+        # misleading 'section missing'.
+        if sensor_reject_reasons:
+            raise ValueError(
+                "cameras.xml: no usable sensor calibration. "
+                + "; ".join(sensor_reject_reasons)
+            )
+        raise ValueError(
+            "cameras.xml: <sensors> section empty or missing adjusted calibrations"
+        )
 
     chunk_transform = _parse_chunk_transform(chunk)
     if chunk_transform is not None:
@@ -315,7 +327,13 @@ def parse_cameras_xml(
     )
 
 
-def _parse_sensors(chunk: ET.Element, warnings: list[str]) -> dict[int, SensorCalibration]:
+def _parse_sensors(
+    chunk: ET.Element,
+    warnings: list[str],
+    reject_reasons: Optional[list[str]] = None,
+) -> dict[int, SensorCalibration]:
+    if reject_reasons is None:
+        reject_reasons = []
     sensors_el = chunk.find("sensors")
     if sensors_el is None:
         return {}
@@ -348,24 +366,40 @@ def _parse_sensors(chunk: ET.Element, warnings: list[str]) -> dict[int, SensorCa
             # Fall back to any calibration child.
             calib = sensor_el.find("calibration")
         if calib is None:
-            warnings.append(f"sensor {sensor_label}: no calibration; skipped")
+            msg = f"sensor {sensor_label}: no calibration"
+            warnings.append(msg + "; skipped")
+            reject_reasons.append(msg)
             continue
 
         calib_res = calib.find("resolution")
         res = calib_res if calib_res is not None else sensor_res
         if res is None:
-            warnings.append(f"sensor {sensor_label}: no <resolution>; skipped")
+            msg = f"sensor {sensor_label}: no <resolution>"
+            warnings.append(msg + "; skipped")
+            reject_reasons.append(msg)
             continue
         try:
             width = int(res.attrib["width"])
             height = int(res.attrib["height"])
         except (KeyError, ValueError):
-            warnings.append(f"sensor {sensor_label}: malformed <resolution>; skipped")
+            msg = f"sensor {sensor_label}: malformed <resolution>"
+            warnings.append(msg + "; skipped")
+            reject_reasons.append(msg)
+            continue
+        if width <= 0 or height <= 0:
+            msg = f"sensor {sensor_label}: non-positive resolution {width}x{height}"
+            warnings.append(msg + "; skipped")
+            reject_reasons.append(msg)
             continue
 
         f = _read_float(calib, "f")
-        if f <= 0.0:
-            warnings.append(f"sensor {sensor_label}: f={f}; skipped")
+        if not math.isfinite(f) or f <= 0.0:
+            msg = (
+                f"sensor {sensor_label}: invalid focal length f={f} "
+                f"(must be a positive number of pixels)"
+            )
+            warnings.append(msg + "; skipped")
+            reject_reasons.append(msg)
             continue
         cx = _read_float(calib, "cx")
         cy = _read_float(calib, "cy")

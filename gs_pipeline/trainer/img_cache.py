@@ -51,7 +51,18 @@ def build_image_cache(
         if not cache_path.is_file():
             if i % 50 == 0 or i == n - 1:
                 _log.info("img_cache: pre-decoding %d/%d ...", i + 1, n)
-            img = Image.open(src).convert("RGB")
+            try:
+                img = Image.open(src).convert("RGB")
+            except Exception as exc:
+                # Corrupt / 0-byte / unreadable / decompression-bomb image. Raise a
+                # clear, actionable message naming the offending file rather than
+                # letting a raw PIL error (UnidentifiedImageError / OSError /
+                # DecompressionBombError) bubble up unexplained.
+                raise ValueError(
+                    f"could not decode training image {src.name!r} "
+                    f"(camera {i}): {type(exc).__name__}: {exc}. "
+                    f"The bundle contains a corrupt, empty, or unreadable image."
+                ) from exc
             if ds < 1.0:
                 w, h = img.size
                 new_w = max(1, int(round(w * ds)))
