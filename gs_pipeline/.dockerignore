@@ -1,0 +1,19 @@
+# Build context is this package dir (docker-compose: context = ..).
+# Keep stale bytecode, caches, and host runtime dirs out of /app/gs_pipeline/.
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# Host-side runtime job dirs (mounted at runtime; never baked into the image).
+inbox/
+outbox/
+logs/
+work/
+config/
+
+# Tests and fixtures aren't needed at container runtime.
+tests/

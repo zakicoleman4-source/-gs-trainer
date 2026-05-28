@@ -12,6 +12,14 @@ for d in /data/inbox /data/outbox /data/logs /data/work /data/config; do
     mkdir -p "$d"
 done
 
+# Single source of truth for the upload limit. The UI reads MAX_UPLOAD_GB to
+# render the "Max N GB" hint; streamlit enforces STREAMLIT_SERVER_MAX_UPLOAD_SIZE
+# (in MB). Derive the latter from the former here so the displayed and enforced
+# limits can never drift. `set -u` is active, so default MAX_UPLOAD_GB if unset.
+MAX_UPLOAD_GB="${MAX_UPLOAD_GB:-8}"
+export STREAMLIT_SERVER_MAX_UPLOAD_SIZE="$(( MAX_UPLOAD_GB * 1024 ))"
+echo "[entrypoint] upload limit: ${MAX_UPLOAD_GB} GB (${STREAMLIT_SERVER_MAX_UPLOAD_SIZE} MB)"
+
 # Surface the actual GPU we'll train on in the container logs (helps debug
 # nvidia-container-toolkit / driver mismatches).
 if command -v nvidia-smi >/dev/null 2>&1; then

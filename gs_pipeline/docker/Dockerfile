@@ -43,6 +43,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
+# Bootstrap pip INTO python3.11. The base image's `python3-pip` package only
+# installs pip for the system python3.10; python3.11 ships without pip, so the
+# very first `python -m pip` (python -> python3.11) would die with
+# "No module named pip" and abort the build. `ensurepip` (provided by
+# python3.11-venv) installs pip into python3.11's site-packages. This was the
+# root cause of the repeated broken images: every `python -m pip` after this
+# point depends on it existing.
+RUN python -m ensurepip --upgrade \
+ && python -m pip --version
+
 # CPU-side deps (Streamlit UI, parser, plyfile, numpy, etc.).
 # IMPORTANT: use `python -m pip` (not bare `pip`) so packages install into
 # the python3.11 that the symlink at /usr/local/bin/python points to.
