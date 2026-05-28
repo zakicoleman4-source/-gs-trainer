@@ -28,4 +28,7 @@ else
     echo "[entrypoint] WARNING: nvidia-smi not present; training will fail." >&2
 fi
 
+# The apt `supervisor` runs under the native python3.10 (#!/usr/bin/python3),
+# whose system python3-setuptools still provides pkg_resources. No version
+# gymnastics needed now that the whole image is python3.10.
 exec /usr/bin/supervisord -c /etc/supervisor/conf.d/gs_pipeline.conf

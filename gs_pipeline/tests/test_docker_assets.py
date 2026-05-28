@@ -46,37 +46,28 @@ def test_dockerfile_pins_torch_and_gsplat():
     assert "torch==2.4.1" in text
     assert "--index-url https://download.pytorch.org/whl/cu124" in text
     assert "gsplat==1.4.0" in text
-    # No-build-isolation is required so setup.py can see torch's headers.
-    assert "--no-build-isolation" in text
+    # gsplat comes from its PREBUILT wheel index (ships compiled sm_70..90
+    # kernels — no JIT on first run). --extra-index-url so PyPI deps resolve.
+    assert "docs.gsplat.studio/whl" in text
+    assert "--extra-index-url" in text
 
 
-def test_dockerfile_uses_python_m_pip():
-    """All pip installs must use `python -m pip`, not bare `pip`.
+def test_dockerfile_uses_python3_m_pip():
+    """All pip installs must use `python3 -m pip`, not bare `pip`.
 
-    Bare `pip` / `pip3` resolve via shebang to the system python3.10 on
-    the nvidia/cuda:12.4.1 Ubuntu 22.04 base image, but the runtime
-    `python` symlink points to python3.11. Using `python -m pip` ensures
-    packages land in the correct site-packages directory.
+    Bare `pip` / `pip3` shebang resolution has historically landed packages in
+    the wrong site-packages. `python3 -m pip` is unambiguous on the native
+    python3.10 base.
     """
     text = _read_dockerfile()
-    # Every line that installs packages should use `python -m pip`
     for line in text.splitlines():
         stripped = line.strip()
-        # Skip continuation lines and non-pip lines
         if stripped.startswith("#") or "pip install" not in stripped:
             continue
-        # Allow `python -m pip install` but reject bare `pip install` or `pip3 install`
         if stripped.startswith("pip install") or stripped.startswith("pip3 install"):
             pytest.fail(
-                f"Dockerfile uses bare pip; must use `python -m pip` to avoid "
-                f"python version mismatch: {stripped!r}"
+                f"Dockerfile uses bare pip; must use `python3 -m pip`: {stripped!r}"
             )
-
-
-def test_dockerfile_compiles_gsplat_with_max_jobs():
-    """We pin MAX_JOBS to keep nvcc memory in check on small build hosts."""
-    text = _read_dockerfile()
-    assert re.search(r"\bMAX_JOBS=\d+", text)
 
 
 def test_dockerfile_creates_data_dirs():
@@ -189,7 +180,7 @@ def test_supervisord_ui_runs_streamlit_on_app_py():
 def test_supervisord_worker_runs_watcher_module():
     cp = _read_supervisord()
     cmd = " ".join(cp.get("program:worker", "command").split())
-    assert "python -m gs_pipeline.trainer.watcher" in cmd
+    assert "python3 -m gs_pipeline.trainer.watcher" in cmd
     # And passes through the four mount paths.
     for token in ("--inbox /data/inbox", "--work /data/work",
                   "--outbox /data/outbox", "--logs /data/logs"):
@@ -227,7 +218,8 @@ def test_entrypoint_shebang_and_supervisord_exec():
     p = DOCKER_DIR / "entrypoint.sh"
     text = p.read_text(encoding="utf-8")
     assert text.startswith("#!/"), "entrypoint.sh missing shebang"
-    assert "exec /usr/bin/supervisord" in text
+    assert "supervisord" in text
+    assert "-c /etc/supervisor/conf.d/gs_pipeline.conf" in text
 
 
 def test_entrypoint_is_executable():

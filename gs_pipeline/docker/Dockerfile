@@ -4,11 +4,18 @@
 # Run:     docker compose -f gs_pipeline/docker/docker-compose.yml up -d
 # URL:     http://<host>:8501
 #
-# gsplat's CUDA extension is precompiled into the image (MAX_JOBS=2, no
-# build isolation) so first-run inside a container never JITs. Pinning:
-#   torch  == 2.4.1 + cu124
-#   gsplat == 1.4.0
-#   cuda base image: 12.4.1 cudnn devel (matches torch's cu124 wheels)
+# Design notes (learned the hard way over many broken images):
+#  - Uses Ubuntu 22.04's NATIVE python3.10. No python3.11 symlink gymnastics:
+#    python3-pip works out of the box, python3-setuptools provides pkg_resources
+#    (supervisor needs it), and the gsplat PREBUILT wheel only ships for cp310.
+#  - gsplat is installed from its PREBUILT wheel index (docs.gsplat.studio),
+#    which ships a real compiled csrc.so for sm_70..sm_90 (covers A5000 sm_86,
+#    A6000 sm_80). This means NO JIT compile on first training run — the old
+#    `pip install gsplat` was JIT-only and hung ~10 min on first use.
+#  - setuptools is NOT upgraded past 80: setuptools 81 deprecated and 82 removed
+#    pkg_resources, which made supervisord crash on startup. We keep the system
+#    setuptools (59.x) which still ships pkg_resources.
+#   torch  == 2.4.1 + cu124,  gsplat == 1.4.0+pt24cu124 (prebuilt)
 
 ARG CUDA_IMAGE=nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
 FROM ${CUDA_IMAGE}
@@ -17,96 +24,67 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.9;9.0" \
-    MAX_JOBS=2
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# System packages.
-# python3.11-dev: provides Python.h — required to compile ANY C extension
-#   (numpy, scipy, Pillow, gsplat CUDA kernels, etc.).
-# libopenblas-dev: BLAS/LAPACK for scipy (and numpy's linalg).
-# libjpeg-dev, libpng-dev, zlib1g-dev, libtiff-dev, libwebp-dev,
-#   libfreetype-dev: Pillow build-time headers so it links against system
-#   imaging libs instead of bundling its own (smaller image, faster build).
-# libgomp1: OpenMP runtime needed by open3d and numpy BLAS at runtime.
-# pkg-config: lets build systems locate the above libraries.
+# System packages (all for the native python3.10):
+# - python3, python3-pip, python3-dev: interpreter + Python.h for any C build
+# - python3-setuptools: provides pkg_resources (supervisor imports it)
+# - supervisor: process manager for UI + worker
+# - libopenblas: scipy/numpy linalg; Pillow image libs; ffmpeg for timelapse
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.11 python3.11-dev python3.11-venv python3-pip \
+    python3 python3-dev python3-pip python3-setuptools python3-venv \
     build-essential ninja-build git curl ca-certificates pkg-config \
     supervisor libgl1 libglib2.0-0 ffmpeg \
     libopenblas-dev \
     libjpeg-dev libpng-dev zlib1g-dev libtiff-dev libwebp-dev \
     libfreetype-dev libgomp1 \
- && rm -rf /var/lib/apt/lists/* \
- && ln -sf /usr/bin/python3.11 /usr/local/bin/python \
- && ln -sf /usr/bin/python3.11 /usr/local/bin/python3
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Bootstrap pip INTO python3.11. The base image's `python3-pip` package only
-# installs pip for the system python3.10; python3.11 ships without pip, so the
-# very first `python -m pip` (python -> python3.11) would die with
-# "No module named pip" and abort the build. `ensurepip` (provided by
-# python3.11-venv) installs pip into python3.11's site-packages. This was the
-# root cause of the repeated broken images: every `python -m pip` after this
-# point depends on it existing.
-RUN python -m ensurepip --upgrade \
- && python -m pip --version
-
-# CPU-side deps (Streamlit UI, parser, plyfile, numpy, etc.).
-# IMPORTANT: use `python -m pip` (not bare `pip`) so packages install into
-# the python3.11 that the symlink at /usr/local/bin/python points to.
-# Bare `pip` / `pip3` may resolve to the system python3.10 shebang and
-# install into the wrong site-packages, causing ImportError at runtime.
+# CPU-side deps. python3-pip targets python3.10 natively (no symlink tricks).
+# Upgrade pip/wheel only — NOT setuptools (keep the system 59.x that has
+# pkg_resources; setuptools>=81 removed it and breaks supervisor).
 COPY requirements-cpu.txt requirements-gpu.txt /app/
-RUN python -m pip install --upgrade pip wheel setuptools \
- && python -m pip install -r requirements-cpu.txt
+RUN python3 -m pip install --upgrade pip wheel \
+ && python3 -m pip install -r requirements-cpu.txt
 
-# Torch (cu124 wheels). Pinned to the version gsplat 1.4.x was tested with.
-RUN python -m pip install --index-url https://download.pytorch.org/whl/cu124 \
+# Torch (cu124 wheels) for python3.10.
+RUN python3 -m pip install --index-url https://download.pytorch.org/whl/cu124 \
     torch==2.4.1 torchvision==0.19.1
 
-# Other GPU deps (open3d, scikit-image, matplotlib).
-RUN python -m pip install -r requirements-gpu.txt
+# Other GPU deps (open3d, scikit-image, matplotlib, tyro).
+RUN python3 -m pip install -r requirements-gpu.txt
 
-# gsplat: precompile the CUDA extension at image build time so the container
-# never has to JIT on first inference. `--no-build-isolation` makes setup.py
-# see torch's headers; MAX_JOBS=2 keeps the parallel nvcc within memory bounds
-# on smaller build hosts.
-RUN python -m pip install --no-build-isolation gsplat==1.4.0
+# gsplat from the PREBUILT wheel index — ships a compiled csrc.so for
+# sm_70/75/80/86/90, so the container never JIT-compiles. --extra-index-url
+# (not --index-url) so PyPI deps like `rich` still resolve.
+RUN python3 -m pip install gsplat==1.4.0 \
+    --extra-index-url https://docs.gsplat.studio/whl/pt24cu124
 
-# Comprehensive smoke test: verify that EVERY package the pipeline needs is
-# importable from the python3.11 runtime.  Catches:
-#   - pip/Python version mismatches (e.g. pip installed to python3.10)
-#   - missing system libraries (libopenblas, libjpeg, etc.)
-#   - broken CUDA extension builds (gsplat)
-# If ANY import fails the build aborts immediately — no more silent breakage.
-RUN python -c "\
-import sys; \
+# Comprehensive smoke test: import EVERY package the pipeline needs, confirm
+# gsplat ships a precompiled .so (not JIT), and verify pkg_resources +
+# supervisor import (the things that broke past images). Build aborts on any
+# failure — no more silent breakage shipped to the client.
+RUN python3 -c "\
+import importlib, sys, glob; \
 print(f'Python {sys.version}'); \
-import numpy; print(f'numpy {numpy.__version__}'); \
-import scipy; print(f'scipy {scipy.__version__}'); \
-import scipy.spatial; \
-from PIL import Image; import PIL; print(f'Pillow {PIL.__version__}'); \
-import yaml; print(f'PyYAML {yaml.__version__}'); \
-import plyfile; print(f'plyfile {plyfile.__version__}'); \
-import watchdog; print(f'watchdog {watchdog.__version__}'); \
-import streamlit; print(f'streamlit {streamlit.__version__}'); \
-import torch; print(f'torch {torch.__version__}, CUDA {torch.version.cuda}'); \
-import torchvision; print(f'torchvision {torchvision.__version__}'); \
-import gsplat; print(f'gsplat {gsplat.__version__}'); \
+mods = ['numpy','scipy','scipy.spatial','PIL','yaml','plyfile','watchdog', \
+        'streamlit','torch','torchvision','gsplat','open3d','matplotlib', \
+        'skimage','tyro','pkg_resources','supervisor.supervisord']; \
+[print(f'  {m} {getattr(importlib.import_module(m), \"__version__\", \"ok\")}') for m in mods]; \
 from gsplat import rasterization; \
 from gsplat.strategy import MCMCStrategy; \
-import open3d; print(f'open3d {open3d.__version__}'); \
-import matplotlib; print(f'matplotlib {matplotlib.__version__}'); \
-import skimage; print(f'scikit-image {skimage.__version__}'); \
-import tyro; print(f'tyro {tyro.__version__}'); \
+import gsplat, os; \
+so = glob.glob(os.path.dirname(gsplat.__file__) + '/*.so'); \
+assert so, 'gsplat has NO precompiled .so — would JIT at runtime!'; \
+print(f'  gsplat precompiled kernel: {so[0]}'); \
+import torch; print(f'CUDA build: {torch.version.cuda}'); \
 print('=== ALL IMPORTS OK ==='); \
 "
 
 # Application code. Build context is the gs_pipeline package directory
-# (see docker-compose.yml: context = ..), so `.` here is the package root
-# and we copy its contents into /app/gs_pipeline/.
+# (docker-compose.yml: context = ..), so `.` is the package root.
 COPY . /app/gs_pipeline/
 COPY docker/supervisord.conf /etc/supervisor/conf.d/gs_pipeline.conf
 COPY docker/entrypoint.sh /entrypoint.sh
