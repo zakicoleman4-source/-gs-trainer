@@ -173,6 +173,48 @@ def test_image_downscale_rejects_zero_side():
 
 
 # ---------------------------------------------------------------------------
+# estimate_vram_bytes / fits_in_vram — must reflect *training* peak, not
+# inference. The old 250 B/px estimate let the budget pick combos that OOM'd.
+# ---------------------------------------------------------------------------
+
+def test_vram_estimate_accounts_for_training_per_pixel_cost():
+    """A 7.7 MP image's rasterizer term must be GBs, not a rounding error."""
+    from gs_pipeline.trainer.budget import (
+        estimate_vram_bytes, DEFAULT_FIXED_OVERHEAD_BYTES, PER_PIXEL_BYTES,
+    )
+    # per_pixel must be a *training*-scale number, well above the old 250.
+    assert PER_PIXEL_BYTES >= 500
+    # Image-only contribution (zero splats) for 3200x2400 must exceed ~3 GB.
+    est = estimate_vram_bytes(0, 3200, 2400)
+    image_term = est - DEFAULT_FIXED_OVERHEAD_BYTES
+    assert image_term > 3 * GB
+
+
+def test_vram_estimate_includes_intersection_density_term():
+    """More splats at the same resolution must raise the estimate beyond the
+    plain per-splat term (tile-intersection lists scale with density)."""
+    from gs_pipeline.trainer.budget import estimate_vram_bytes, DEFAULT_PER_SPLAT_BYTES
+    low = estimate_vram_bytes(1_000_000, 2000, 2000)
+    high = estimate_vram_bytes(10_000_000, 2000, 2000)
+    delta = high - low
+    plain_splat_delta = 9_000_000 * DEFAULT_PER_SPLAT_BYTES
+    assert delta > plain_splat_delta  # intersection term adds on top
+
+
+def test_high_splat_highres_combo_correctly_rejected_on_24gb():
+    """13 M splats + 3200x2400 must NOT be reported as fitting 24 GB.
+
+    This is the exact production scenario that OOM'd six shipped images: the
+    splat memory alone (~16.6 GB) plus a full-res image cannot coexist in the
+    22 GB safety budget. The estimator must catch it.
+    """
+    from gs_pipeline.trainer.budget import fits_in_vram
+    assert not fits_in_vram(24 * GB, 13_000_000, 3200, 2400)
+    # ...but a sensibly reduced image side for that splat count does fit.
+    assert fits_in_vram(24 * GB, 13_000_000, 1600, 1200)
+
+
+# ---------------------------------------------------------------------------
 # compute_budget (end-to-end)
 # ---------------------------------------------------------------------------
 
@@ -189,15 +231,28 @@ def test_typical_scene_on_24gb_returns_sane_numbers():
         quality_preset="Auto",
     )
     assert b.n_cameras == 80
-    # 24 GB card auto-selects max_image_side=3200; images at 4000 get downscaled.
-    assert b.image_max_side == 3200
-    assert b.downscale_factor == pytest.approx(3200 / 4000, rel=0.01)
+    # 24 GB card's table value is 3200px, but this scene wants 0.87*hard_cap
+    # (~13M) splats. Those splats alone consume ~16.6 GB, so the *training*
+    # VRAM estimate (corrected to account for the forward+backward rasterizer
+    # buffers + tile-intersection lists) no longer fits a 3200px image. The
+    # budget correctly steps the image side DOWN so the run actually fits —
+    # this is the fix for the repeated production OOMs. We assert the side is
+    # reduced below the table value and that every camera shares one factor.
+    assert b.image_max_side < 3200
+    assert b.image_max_side >= 1600  # not collapsed to the floor
+    expected_factor = b.image_max_side / 4000
+    assert b.downscale_factor == pytest.approx(expected_factor, rel=0.02)
     assert len(b.downscale_per_camera) == 80
-    assert all(abs(f - 3200 / 4000) < 0.01 for f in b.downscale_per_camera)
+    assert all(abs(f - expected_factor) < 0.02 for f in b.downscale_per_camera)
     # 12 * 1.5M dense = 18M; clipped at 0.87 * hard_cap_24gb
     assert b.target_splats == int(b.hard_cap_splats * DEFAULT_TARGET_CAP_RATIO)
     assert any("exceeds VRAM budget" in n for n in b.notes)
     assert b.iterations == QUALITY_ITERATIONS["Auto"]
+    # The chosen (splats, image) combo must actually fit the training estimate.
+    from gs_pipeline.trainer.budget import fits_in_vram
+    _tw = int(4000 * b.downscale_factor)
+    _th = int(3000 * b.downscale_factor)
+    assert fits_in_vram(GPU_24GB.total_vram_bytes, b.target_splats, _tw, _th)
 
 
 def test_same_scene_on_48gb_uses_more_splats():
@@ -293,13 +348,16 @@ def test_mixed_camera_sizes_per_camera_downscale():
         quality_preset="Auto",
     )
     assert len(b.downscale_per_camera) == 15
-    # Sony cameras: scaled down from 8000 to 3200 (24 GB class → 3200 px)
+    side = b.image_max_side  # whatever side actually fits the training estimate
+    # Each camera is independently scaled so its longest edge lands at `side`.
+    # Sony (8000px longest) gets a more aggressive factor than GoPro (3840px).
     assert all(
-        f == pytest.approx(3200 / 8000, rel=0.01) for f in b.downscale_per_camera[:5]
+        f == pytest.approx(side / 8000, rel=0.01) for f in b.downscale_per_camera[:5]
     )
-    # GoPro cameras: scaled down from 3840 to 3200 (less severe than Sony)
     assert all(
-        f == pytest.approx(3200 / 3840, rel=0.01) for f in b.downscale_per_camera[5:]
+        f == pytest.approx(side / 3840, rel=0.01) for f in b.downscale_per_camera[5:]
     )
-    # Global downscale_factor is the smallest (Sony's, since 8000 >> 3200)
-    assert b.downscale_factor == pytest.approx(3200 / 8000, rel=0.01)
+    # Per-camera factors are genuinely different (the whole point of per-camera).
+    assert b.downscale_per_camera[0] < b.downscale_per_camera[5]
+    # Global downscale_factor is the smallest (Sony's, since 8000 >> side).
+    assert b.downscale_factor == pytest.approx(side / 8000, rel=0.01)

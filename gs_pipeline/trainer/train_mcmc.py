@@ -486,9 +486,16 @@ def train(
             K, w2c, image_path = _load_camera(scene, cam_i)
             target_img = _load_image_tensor(image_path, 1.0, device)  # pre-cached at training res
             mask_path = scene.mask_paths[cam_i] if scene.mask_paths else None
-            ds_cam = (budget.downscale_per_camera[cam_i] if budget.downscale_per_camera
-                      else budget.downscale_factor)
-            valid = _load_valid_mask(mask_path, ds_cam, device)
+            # The mask is loaded from the original masks/ dir (it is NOT pre-cached
+            # like the training images), so it must be resized to exactly match the
+            # already-downscaled cached image — not merely scaled by ds_cam, which
+            # can differ by a pixel due to round() vs int() truncation and produce a
+            # shape mismatch in the loss multiply.  Pin the mask to the loaded
+            # image's (H, W) so pred/target/valid always align.
+            valid = _load_valid_mask(
+                mask_path, device,
+                target_hw=(int(target_img.shape[0]), int(target_img.shape[1])),
+            )
 
             # Progressive coarse-to-fine resolution: scale K and target image
             # for early training, then ramp to full res.  K was already pre-scaled
@@ -1044,12 +1051,18 @@ def _load_image_tensor(image_path: Path, downscale: float, device):
     return torch.from_numpy(_load_image_np(image_path, downscale)).to(device)
 
 
-def _load_valid_mask(mask_path, downscale: float, device):
+def _load_valid_mask(mask_path, device, *, target_hw=None):
     """Load a Metashape mask PNG as a (H, W, 1) validity tensor on ``device``.
 
     Inverts Metashape's convention (white=excluded → 0, black=keep → 1) so the
     result can be multiplied directly against pred/target in the loss.
     Returns None if mask_path is None (no mask for this camera).
+
+    ``target_hw`` is the (H, W) of the already-loaded training image. The mask
+    is resized to *exactly* this size so it always lines up with pred/target —
+    the training image is read from a pre-cached, downscaled JPEG while the mask
+    is read from the original masks/ dir, and scaling each independently by the
+    raw downscale factor can drift by a pixel (round() vs int() truncation).
     """
     if mask_path is None:
         return None
@@ -1058,11 +1071,10 @@ def _load_valid_mask(mask_path, downscale: float, device):
     try:
         from PIL import Image
         img = Image.open(mask_path).convert("L")
-        w, h = img.size
-        if downscale != 1.0:
-            nw = max(1, int(w * downscale))
-            nh = max(1, int(h * downscale))
-            img = img.resize((nw, nh), Image.NEAREST)
+        if target_hw is not None:
+            th, tw = int(target_hw[0]), int(target_hw[1])
+            if (img.size[1], img.size[0]) != (th, tw):
+                img = img.resize((max(1, tw), max(1, th)), Image.NEAREST)
         arr = np.array(img, dtype=np.float32) / 255.0
         # Invert: Metashape white=excluded → we want 0=excluded, 1=valid.
         valid = torch.from_numpy(1.0 - arr).unsqueeze(-1).to(device)  # (H, W, 1)

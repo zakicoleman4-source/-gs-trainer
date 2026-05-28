@@ -212,9 +212,23 @@ def compute_image_downscale(
 # VRAM estimation — predict whether a (splats, resolution) combo fits
 # ---------------------------------------------------------------------------
 
-# Rasterizer per-pixel cost: rendered RGBA + gradients + tile metadata.
-# Empirically ~200-300 bytes/pixel; we budget 250 as a safe middle ground.
-PER_PIXEL_BYTES = 250
+# Rasterizer per-pixel cost. The previous value (250) was an *inference*-only
+# estimate and badly underestimated the *training* peak, which is what we must
+# budget for — every shipped image OOM'd a card the estimator said was fine.
+#
+# During the backward pass gsplat keeps, per rendered pixel: the RGB+D output
+# and its gradient, per-pixel alpha accumulation + its gradient, the last-
+# contributor index, and the saved transmittance buffers — on top of the
+# forward render targets and the multiscale/antialiased intermediates this
+# pipeline also allocates.  Measured peak for RGB+D + antialiased training is
+# ~500-700 B/px; we budget 600.
+PER_PIXEL_BYTES = 600
+
+# The tile-intersection list scales with both image area and splat density:
+# more splats means more (tile, gaussian) pairs, each ~8 bytes (a sorted key +
+# id).  Budget a small per-(pixel * Msplat) term so high-splat-count + high-res
+# combos — exactly what OOMs in production — are predicted to OOM here too.
+PER_PIXEL_PER_MSPLAT_BYTES = 12  # bytes per pixel per million splats
 
 
 def estimate_vram_bytes(
@@ -226,10 +240,19 @@ def estimate_vram_bytes(
     fixed_overhead_bytes: int = DEFAULT_FIXED_OVERHEAD_BYTES,
     per_pixel_bytes: int = PER_PIXEL_BYTES,
 ) -> int:
-    """Estimate peak GPU memory for training with the given parameters."""
+    """Estimate peak GPU memory for *training* with the given parameters.
+
+    Three terms:
+      * ``splat_mem`` — params + grads + Adam moments + MCMC scratch per splat.
+      * ``image_mem`` — rasterizer forward+backward per-pixel buffers.
+      * ``intersect_mem`` — tile-intersection lists, which grow with both the
+        pixel count and the splat density (more splats → more tile overlaps).
+    """
+    n_pixels = image_w * image_h
     splat_mem = target_splats * per_splat_bytes
-    image_mem = image_w * image_h * per_pixel_bytes
-    return fixed_overhead_bytes + splat_mem + image_mem
+    image_mem = n_pixels * per_pixel_bytes
+    intersect_mem = int(n_pixels * (target_splats / 1_000_000.0) * PER_PIXEL_PER_MSPLAT_BYTES)
+    return fixed_overhead_bytes + splat_mem + image_mem + intersect_mem
 
 
 def fits_in_vram(

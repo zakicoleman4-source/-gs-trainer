@@ -270,3 +270,56 @@ def test_fisher_prune_can_be_enabled_via_yaml(tmp_path: Path):
     assert cfg.fisher_prune_enabled is True
     assert cfg.fisher_prune_ratio == pytest.approx(0.6)
     assert cfg.fisher_prune_n_views == 10
+
+
+# ---------------------------------------------------------------------------
+# _load_valid_mask — must match the training image resolution exactly
+# ---------------------------------------------------------------------------
+
+def _make_mask_png(path: Path, w: int, h: int) -> None:
+    """Write a Metashape-style mask (white=excluded, black=keep)."""
+    from PIL import Image
+    arr = np.zeros((h, w), dtype=np.uint8)
+    arr[: h // 2, :] = 255  # top half excluded
+    Image.fromarray(arr, mode="L").save(path)
+
+
+def test_load_valid_mask_pinned_to_target_resolution(tmp_path: Path):
+    """The mask must come back at *exactly* the training image's (H, W).
+
+    Regression: the training image is read from a pre-cached, round()-downscaled
+    JPEG while the mask is read from the original masks/ dir. Scaling the mask by
+    the raw downscale factor (int truncation) could differ by a pixel and crash
+    the loss multiply. The mask is now resized to the loaded image's shape.
+    """
+    import torch
+    from gs_pipeline.trainer.train_mcmc import _load_valid_mask
+
+    # Original mask at an odd resolution that round() vs int() would disagree on.
+    mask_path = tmp_path / "IMG_001.png"
+    _make_mask_png(mask_path, w=801, h=601)
+
+    # Training image landed at this (H, W) after a round()-based cache downscale.
+    target_h, target_w = 301, 401
+    valid = _load_valid_mask(mask_path, torch.device("cpu"), target_hw=(target_h, target_w))
+
+    assert valid is not None
+    assert tuple(valid.shape) == (target_h, target_w, 1)
+    # Inverted convention: top half (excluded → white) must be ~0, bottom ~1.
+    assert float(valid[: target_h // 2].mean()) < 0.1
+    assert float(valid[target_h // 2 + 1 :].mean()) > 0.9
+
+
+def test_load_valid_mask_none_passthrough():
+    import torch
+    from gs_pipeline.trainer.train_mcmc import _load_valid_mask
+    assert _load_valid_mask(None, torch.device("cpu"), target_hw=(10, 10)) is None
+
+
+def test_load_valid_mask_already_matching_size_untouched(tmp_path: Path):
+    import torch
+    from gs_pipeline.trainer.train_mcmc import _load_valid_mask
+    mask_path = tmp_path / "IMG_002.png"
+    _make_mask_png(mask_path, w=64, h=48)
+    valid = _load_valid_mask(mask_path, torch.device("cpu"), target_hw=(48, 64))
+    assert tuple(valid.shape) == (48, 64, 1)
